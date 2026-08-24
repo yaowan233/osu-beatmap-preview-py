@@ -14,9 +14,12 @@ crate-type = ["cdylib"]
 osu-beatmap-preview-core = { package = "osu-beatmap-preview", git = "https://github.com/2710165659/osu-beatmap-preview", rev = "6c74511499fe781c655b4ef68d3c7e978c9c4212" }
 pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
 serde_json = "1"
+# The upstream renderer uses ureq without its opt-in environment proxy support.
+# Cargo unifies this feature with the upstream dependency, so every renderer
+# request honors HTTP_PROXY/HTTPS_PROXY without adding another Python setting.
+ureq = { version = "2", features = ["proxy-from-env"] }
 
 [profile.release]
 codegen-units = 1
 lto = "thin"
 strip = true
-

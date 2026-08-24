@@ -739,6 +739,7 @@ dependencies = [
  "osu-beatmap-preview",
  "pyo3",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]
