@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "osu-beatmap-preview-py"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "osu-beatmap-preview",
  "pyo3",
