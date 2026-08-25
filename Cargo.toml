@@ -1,6 +1,6 @@
 [package]
 name = "osu-beatmap-preview-py"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Python bindings for osu-beatmap-preview"
@@ -11,7 +11,7 @@ name = "_core"
 crate-type = ["cdylib"]
 
 [dependencies]
-osu-beatmap-preview-core = { package = "osu-beatmap-preview", git = "https://github.com/yaowan233/osu-beatmap-preview", rev = "0ba0f1f6112a98932a8cfe61a56925fffa2f8978" }
+osu-beatmap-preview-core = { package = "osu-beatmap-preview", git = "https://github.com/yaowan233/osu-beatmap-preview", rev = "407d7624576056e5fb3ec894ffbb5dbcf657bd52" }
 pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
 serde_json = "1"
 

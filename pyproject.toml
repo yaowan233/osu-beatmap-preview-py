@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "osu-beatmap-preview-py"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python bindings for the osu-beatmap-preview renderer"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -51,4 +51,3 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
-
