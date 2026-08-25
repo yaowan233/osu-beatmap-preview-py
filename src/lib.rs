@@ -19,6 +19,7 @@ create_exception!(_core, PreviewError, PyException);
     preview_30s = false,
     gap = None,
     no_cache = false,
+    fps = None,
 ))]
 fn generate_preview_json(
     py: Python<'_>,
@@ -32,6 +33,7 @@ fn generate_preview_json(
     preview_30s: bool,
     gap: Option<f64>,
     no_cache: bool,
+    fps: Option<u32>,
 ) -> PyResult<String> {
     if bid.trim().is_empty() {
         return Err(PyValueError::new_err("bid must not be empty"));
@@ -48,6 +50,7 @@ fn generate_preview_json(
         preview_30s,
         gap,
         no_cache,
+        fps,
     };
 
     let result = py

@@ -708,7 +708,7 @@ dependencies = [
 [[package]]
 name = "osu-beatmap-preview"
 version = "1.0.8"
-source = "git+https://github.com/yaowan233/osu-beatmap-preview?rev=407d7624576056e5fb3ec894ffbb5dbcf657bd52#407d7624576056e5fb3ec894ffbb5dbcf657bd52"
+source = "git+https://github.com/yaowan233/osu-beatmap-preview?rev=24f6afc6ffadfc7346eb5a3f4ec9272763487d18#24f6afc6ffadfc7346eb5a3f4ec9272763487d18"
 dependencies = [
  "bytes",
  "color_quant",
