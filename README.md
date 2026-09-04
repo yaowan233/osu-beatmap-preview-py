@@ -4,8 +4,8 @@
 Python 原生扩展。渲染器通过 PyO3 直接运行在 Python 进程内，不需要下载、配置或启动额外的
 可执行文件。
 
-> 当前为早期开发版本。依赖暂时固定到上游首次公开 Rust library API 的 commit；正式发布前，
-> 应升级到包含该 API 的稳定上游版本。
+> 当前为早期开发版本。Rust 核心固定到经过绑定测试的具体提交，以确保 Python wheel
+> 在各平台使用相同的渲染行为。
 
 ## 安装
 
@@ -25,6 +25,10 @@ result = await generate_preview_async(
     4498112,
     format="gif",
     mods="hd+hr",
+    times="preview+60",
+    duration_time=8,
+    fps=30,
+    scale=1.5,
 )
 print(result["preview-img"])
 ```
@@ -34,6 +38,9 @@ print(result["preview-img"])
 
 `convert` 仅用于将 osu!standard 谱面转换成 `taiko`、`ctb` 或 `mania`。原生非 standard
 谱面不要传入 `convert`。
+
+`times` 使用 `+` 分隔多个秒数，也支持 `preview`；`duration_time` 控制 GIF 片段或 MP4
+区间时长。`config` 可传配置文件路径或内联 JSON/YAML，`scale` 用于临时覆盖输出倍率。
 
 ### 异步取消与并发
 

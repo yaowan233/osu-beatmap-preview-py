@@ -34,6 +34,9 @@ def generate_preview(
     gap: float | None = None,
     no_cache: bool = False,
     fps: int | None = None,
+    duration_time: float | None = None,
+    config: str | None = None,
+    scale: float | None = None,
 ) -> dict[str, Any]:
     """Render a beatmap preview and return the renderer result.
 
@@ -52,6 +55,9 @@ def generate_preview(
         gap=gap,
         no_cache=no_cache,
         fps=fps,
+        duration_time=duration_time,
+        config=config,
+        scale=scale,
     )
     result = json.loads(raw)
     if not isinstance(result, dict):
@@ -72,6 +78,9 @@ async def generate_preview_async(
     gap: float | None = None,
     no_cache: bool = False,
     fps: int | None = None,
+    duration_time: float | None = None,
+    config: str | None = None,
+    scale: float | None = None,
 ) -> dict[str, Any]:
     """Render without blocking the caller's asyncio event loop."""
     return await asyncio.to_thread(
@@ -87,5 +96,7 @@ async def generate_preview_async(
         gap=gap,
         no_cache=no_cache,
         fps=fps,
+        duration_time=duration_time,
+        config=config,
+        scale=scale,
     )
-

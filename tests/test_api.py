@@ -15,12 +15,24 @@ def test_generate_preview_decodes_renderer_result(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(preview, "generate_preview_json", fake_generate)
 
-    result = preview.generate_preview(123, format="gif", mods="hd+hr")
+    result = preview.generate_preview(
+        123,
+        format="gif",
+        mods="hd+hr",
+        times="preview+12.5",
+        duration_time=8.0,
+        fps=30,
+        scale=1.5,
+    )
 
     assert result == {"preview-img": "/tmp/preview.gif"}
     assert captured["bid"] == "123"
     assert captured["format"] == "gif"
     assert captured["mods"] == "hd+hr"
+    assert captured["times"] == "preview+12.5"
+    assert captured["duration_time"] == 8.0
+    assert captured["fps"] == 30
+    assert captured["scale"] == 1.5
 
 
 def test_generate_preview_rejects_non_object_result(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -40,3 +52,23 @@ async def test_generate_preview_async_uses_same_api(monkeypatch: pytest.MonkeyPa
     assert await preview.generate_preview_async(456, format="png") == {
         "preview-img": "preview.png"
     }
+
+
+def test_native_extension_uses_updated_version() -> None:
+    assert preview.__version__ == "0.1.3"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"format": "gif", "gif_clip": True}, "no longer supported"),
+        ({"format": "gif", "times": "NaN"}, "finite"),
+        ({"format": "gif", "preview_30s": True}, "mp4"),
+        ({"format": "png", "gap": 120.0, "config": "{}"}, "custom config"),
+    ],
+)
+def test_native_argument_compatibility_validation(
+    kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        preview.generate_preview(123, **kwargs)
