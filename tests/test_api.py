@@ -55,7 +55,7 @@ async def test_generate_preview_async_uses_same_api(monkeypatch: pytest.MonkeyPa
 
 
 def test_native_extension_uses_updated_version() -> None:
-    assert preview.__version__ == "0.1.4"
+    assert preview.__version__ == "0.1.5"
 
 
 @pytest.mark.parametrize(

@@ -793,7 +793,7 @@ dependencies = [
 [[package]]
 name = "osu-beatmap-preview"
 version = "1.0.8"
-source = "git+https://github.com/yaowan233/osu-beatmap-preview?rev=7cd6102db318719eed0b4178278ff422b01fd290#7cd6102db318719eed0b4178278ff422b01fd290"
+source = "git+https://github.com/yaowan233/osu-beatmap-preview?rev=2ac3d695aa647560e1d8a5eb29382d3bd52255c2#2ac3d695aa647560e1d8a5eb29382d3bd52255c2"
 dependencies = [
  "bytes",
  "color_quant",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "osu-beatmap-preview-py"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "osu-beatmap-preview",
  "pyo3",
