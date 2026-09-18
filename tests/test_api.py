@@ -72,3 +72,18 @@ def test_native_argument_compatibility_validation(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         preview.generate_preview(123, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"fps": 0}, "fps"),
+        ({"duration_time": 0.0}, "duration time"),
+        ({"scale": 0.0}, "scale"),
+    ],
+)
+def test_native_request_forwards_options_to_renderer(
+    kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(preview.PreviewError, match=message):
+        preview.generate_preview(123, **kwargs)

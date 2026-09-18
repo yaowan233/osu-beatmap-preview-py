@@ -1,4 +1,5 @@
-use osu_beatmap_preview_core::{parse_time_point, PreviewOptions, TimePoint};
+use osu_beatmap_preview_cli::{parse_time_point, RenderRequest};
+use osu_beatmap_preview_core::processing::validation::TimePoint;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
@@ -90,19 +91,19 @@ fn generate_preview_json(
     }
 
     let config = config_for_gap(config, gap)?;
-    let mut options = PreviewOptions::new(bid);
-    options.convert = convert;
-    options.mods = mods;
-    options.format = format;
-    options.time_points = time_points;
-    options.duration_time = duration_time;
-    options.no_cache = no_cache;
-    options.fps = fps;
-    options.config = config;
-    options.scale = scale;
+    let mut options = RenderRequest::new(bid);
+    options.ruleset.convert = convert;
+    options.ruleset.mods = mods;
+    options.output.format = format;
+    options.view.time_points = time_points;
+    options.view.duration_seconds = duration_time;
+    options.execution.no_cache = no_cache;
+    options.output.fps = fps;
+    options.execution.config = config;
+    options.output.scale = scale;
 
     let result = py
-        .allow_threads(move || osu_beatmap_preview_core::generate_preview(options))
+        .allow_threads(move || osu_beatmap_preview_cli::generate_preview(options))
         .map_err(|error| PreviewError::new_err(error.to_string()))?;
 
     serde_json::to_string(&result)
