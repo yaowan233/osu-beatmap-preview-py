@@ -1,6 +1,6 @@
 [package]
 name = "osu-beatmap-preview-py"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 license = "MIT"
 description = "Python bindings for osu-beatmap-preview"

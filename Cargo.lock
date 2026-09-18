@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "osu-beatmap-preview-py"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "osu-beatmap-preview-cli",
  "osu-beatmap-preview-core",
