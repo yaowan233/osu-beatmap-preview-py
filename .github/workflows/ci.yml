@@ -20,6 +20,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - uses: dtolnay/rust-toolchain@stable
         with:
+          # 上游代码快照使用已验证的工具链，保证严格 lint 检查结果可复现。
+          toolchain: "1.92.0"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v6
