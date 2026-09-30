@@ -23,7 +23,7 @@ pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
 serde_json = "1"
 
 [patch."https://github.com/2710165659/osu-beatmap-preview"]
-# CTB HD 与默认红果配色补丁随源码分发，避免只修改本机的 Cargo 缓存。
+# 四模式 HD/FL、默认红果配色和模组渲染修复随源码分发，避免只修改本机的 Cargo 缓存。
 osu-beatmap-preview-core = { path = "vendor/osu-beatmap-preview-core" }
 osu-beatmap-preview-cli = { path = "vendor/osu-beatmap-preview-cli" }
 

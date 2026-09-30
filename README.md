@@ -62,17 +62,29 @@ result = await generate_preview_async(
 )
 ```
 
-### 其他模式的 GIF 模组
+### 四种模式的 GIF / MP4 模组
 
 | 模式 | 支持的模组 |
 | --- | --- |
-| Standard | `EZ`、`HR`、`HD`、`TC`、`DA`、`DT`、`HT` |
-| Taiko | `EZ`、`HR`、`SW`、`CS`、`DT`、`HT` |
-| Mania | `1K`–`10K`、`DS`、`IN`、`HO`、`CS`、`DT`、`HT` |
+| Standard | `EZ`、`HR`、`HD`、`FL`、`TC`、`DA`、`DT`、`HT` |
+| Taiko | `EZ`、`HR`、`HD`、`FL`、`SW`、`CS`、`DT`、`HT` |
+| Catch | `EZ`、`HR`、`HD`、`FL`、`DT`、`HT` |
+| Mania | `HD`、`FL`、`1K`–`10K`、`DS`、`IN`、`HO`、`CS`、`DT`、`HT` |
 
-组合中的每个模组都必须受当前模式支持；taiko 和 mania 当前不支持 HD。
+组合中的每个模组都必须受当前模式支持；Mania 的 `HD+FL` 互斥，其余三种模式可组合使用。
 `HD+TC`、`IN+HO`、`EZ+HR`、`DT+HT` 互斥；mania 的键数模组和 DS 只影响 standard 转谱。
 GIF 和 MP4 使用相同的模组支持规则，GIF 在 15、30、60 fps 下也会保持请求的播放时长。
+
+Taiko HD 隐藏普通音符和连打刻度，保留连打条与气球；Mania HD 让音符头、长按主体
+在判定线附近渐隐，遮罩随连击扩大。HD 不会遮住 Mania 判定线、键道背景或 SV 提示。
+Catch HD 在 Kiai 区段持续保留淡淡的物件轮廓，不随 BPM 闪烁；区段结束后恢复普通 HD。
+圆形预览样式暂用约 30% 不透明度近似轮廓亮度，不逐像素复刻皮肤的 lighting 纹理。
+
+FL 在 Standard 跟随自动光标（滑条期间额外暗化），在 Catch 跟随接盘，在 Taiko 固定于判定区；
+Mania FL 只保留中部横向可视带。Standard、Taiko、Catch 在 100/200 combo 时缩小光圈。
+预览没有玩家输入或回放，轨迹用谱面物件之间的插值估算，连击按无 miss 进度计算；
+Standard 的光圈跟随延迟使用连续阻尼近似，Catch 香蕉雨期间沿用相邻水果的插值路线。
+Taiko、Catch、Mania 的 PNG 是静态概览，不支持 HD/FL；Standard 的 PNG 快照支持二者。
 
 ### 异步取消与并发
 
