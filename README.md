@@ -5,7 +5,8 @@ Python 原生扩展。渲染器通过 PyO3 直接运行在 Python 进程内，�
 可执行文件。
 
 > 当前为早期开发版本。Rust 渲染器使用固定提交的上游 v1.3.3，core 与 CLI 随仓库分发，
-> 包含 CTB Hidden 和默认红果配色补丁，以确保 Python wheel 在各平台使用相同的渲染行为。
+> 包含 CTB Hidden、默认红果配色、standard 跨请求缓存、taiko DT/HT 滚动和 GIF 时长补丁，
+> 以确保 Python wheel 在各平台使用相同的渲染行为。
 
 ## 安装
 
@@ -60,6 +61,18 @@ result = await generate_preview_async(
     fps=20,
 )
 ```
+
+### 其他模式的 GIF 模组
+
+| 模式 | 支持的模组 |
+| --- | --- |
+| Standard | `EZ`、`HR`、`HD`、`TC`、`DA`、`DT`、`HT` |
+| Taiko | `EZ`、`HR`、`SW`、`CS`、`DT`、`HT` |
+| Mania | `1K`–`10K`、`DS`、`IN`、`HO`、`CS`、`DT`、`HT` |
+
+组合中的每个模组都必须受当前模式支持；taiko 和 mania 当前不支持 HD。
+`HD+TC`、`IN+HO`、`EZ+HR`、`DT+HT` 互斥；mania 的键数模组和 DS 只影响 standard 转谱。
+GIF 和 MP4 使用相同的模组支持规则，GIF 在 15、30、60 fps 下也会保持请求的播放时长。
 
 ### 异步取消与并发
 
