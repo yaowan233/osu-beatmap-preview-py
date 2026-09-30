@@ -1,0 +1,317 @@
+#![cfg(test)]
+// 保留独立文件与模块入口的双层测试门控，遵循上游规范。
+#![allow(clippy::duplicated_attributes)]
+
+//! 外部谱面 fixture 的 Standard 转谱回归测试。
+
+use crate::domain::models::{Beatmap, HitObjects};
+use crate::domain::mods::{mods_for_mode, parse_mods, ModSettings};
+use std::path::{Path, PathBuf};
+
+struct ConversionCase {
+    name: &'static str,
+    osu_file: &'static str,
+    golden_file: &'static str,
+    target_mode: i32,
+    mod_tokens: &'static [&'static str],
+}
+
+const CASES: &[ConversionCase] = &[
+    ConversionCase {
+        name: "1946909_taiko",
+        osu_file: "1946909.osu",
+        golden_file: "1946909_taiko.golden",
+        target_mode: 1,
+        mod_tokens: &[],
+    },
+    ConversionCase {
+        name: "1946909_mania_4k",
+        osu_file: "1946909.osu",
+        golden_file: "1946909_mania_4k.golden",
+        target_mode: 3,
+        mod_tokens: &["4K"],
+    },
+    ConversionCase {
+        name: "1946909_mania_7k",
+        osu_file: "1946909.osu",
+        golden_file: "1946909_mania_7k.golden",
+        target_mode: 3,
+        mod_tokens: &["7K"],
+    },
+    ConversionCase {
+        name: "2374098_catch",
+        osu_file: "2374098.osu",
+        golden_file: "2374098_catch.golden",
+        target_mode: 2,
+        mod_tokens: &[],
+    },
+    ConversionCase {
+        name: "2374098_mania_5k_ds",
+        osu_file: "2374098.osu",
+        golden_file: "2374098_mania_5k_ds.golden",
+        target_mode: 3,
+        mod_tokens: &["5K", "DS"],
+    },
+    ConversionCase {
+        name: "2374098_mania_6k_ds",
+        osu_file: "2374098.osu",
+        golden_file: "2374098_mania_6k_ds.golden",
+        target_mode: 3,
+        mod_tokens: &["6K", "DS"],
+    },
+    ConversionCase {
+        name: "1024742_catch",
+        osu_file: "1024742.osu",
+        golden_file: "1024742_catch.golden",
+        target_mode: 2,
+        mod_tokens: &[],
+    },
+    ConversionCase {
+        name: "1024742_taiko",
+        osu_file: "1024742.osu",
+        golden_file: "1024742_taiko.golden",
+        target_mode: 1,
+        mod_tokens: &[],
+    },
+    ConversionCase {
+        name: "1024742_mania_default",
+        osu_file: "1024742.osu",
+        golden_file: "1024742_mania_default.golden",
+        target_mode: 3,
+        mod_tokens: &[],
+    },
+    ConversionCase {
+        name: "5051189_catch",
+        osu_file: "5051189.osu",
+        golden_file: "5051189_catch.golden",
+        target_mode: 2,
+        mod_tokens: &[],
+    },
+    ConversionCase {
+        name: "5051189_taiko",
+        osu_file: "5051189.osu",
+        golden_file: "5051189_taiko.golden",
+        target_mode: 1,
+        mod_tokens: &[],
+    },
+    ConversionCase {
+        name: "5051189_mania_default",
+        osu_file: "5051189.osu",
+        golden_file: "5051189_mania_default.golden",
+        target_mode: 3,
+        mod_tokens: &[],
+    },
+    ConversionCase {
+        name: "5051189_mania_default_ds",
+        osu_file: "5051189.osu",
+        golden_file: "5051189_mania_default_ds.golden",
+        target_mode: 3,
+        mod_tokens: &["DS"],
+    },
+    ConversionCase {
+        name: "260177_taiko",
+        osu_file: "260177.osu",
+        golden_file: "260177_taiko.golden",
+        target_mode: 1,
+        mod_tokens: &[],
+    },
+    ConversionCase {
+        name: "260177_catch",
+        osu_file: "260177.osu",
+        golden_file: "260177_catch.golden",
+        target_mode: 2,
+        mod_tokens: &[],
+    },
+    ConversionCase {
+        name: "260177_mania_default",
+        osu_file: "260177.osu",
+        golden_file: "260177_mania_default.golden",
+        target_mode: 3,
+        mod_tokens: &[],
+    },
+    ConversionCase {
+        name: "3451313_mania_1k",
+        osu_file: "3451313.osu",
+        golden_file: "3451313_mania_1k.golden",
+        target_mode: 3,
+        mod_tokens: &["1K"],
+    },
+    ConversionCase {
+        name: "3451313_mania_4k",
+        osu_file: "3451313.osu",
+        golden_file: "3451313_mania_4k.golden",
+        target_mode: 3,
+        mod_tokens: &["4K"],
+    },
+];
+
+macro_rules! conversion_test {
+    ($name:ident, $case:expr) => {
+        #[test]
+        fn $name() {
+            assert_conversion_case($case);
+        }
+    };
+}
+
+conversion_test!(conversion_1946909_taiko, &CASES[0]);
+conversion_test!(conversion_1946909_mania_4k, &CASES[1]);
+conversion_test!(conversion_1946909_mania_7k, &CASES[2]);
+conversion_test!(conversion_2374098_catch, &CASES[3]);
+conversion_test!(conversion_2374098_mania_5k_ds, &CASES[4]);
+conversion_test!(conversion_2374098_mania_6k_ds, &CASES[5]);
+conversion_test!(conversion_1024742_catch, &CASES[6]);
+conversion_test!(conversion_1024742_taiko, &CASES[7]);
+conversion_test!(conversion_1024742_mania_default, &CASES[8]);
+conversion_test!(conversion_5051189_catch, &CASES[9]);
+conversion_test!(conversion_5051189_taiko, &CASES[10]);
+conversion_test!(conversion_5051189_mania_default, &CASES[11]);
+conversion_test!(conversion_5051189_mania_default_ds, &CASES[12]);
+conversion_test!(conversion_260177_taiko, &CASES[13]);
+conversion_test!(conversion_260177_catch, &CASES[14]);
+conversion_test!(conversion_260177_mania_default, &CASES[15]);
+conversion_test!(conversion_3451313_mania_1k, &CASES[16]);
+conversion_test!(conversion_3451313_mania_4k, &CASES[17]);
+
+fn assert_conversion_case(case: &ConversionCase) {
+    let osu_path = fixture_path(case.osu_file);
+    let golden_path = fixture_path(case.golden_file);
+    let osu = read_fixture(&osu_path);
+    let beatmap = crate::domain::parser::parse_beatmap_str_for_tests(&osu).unwrap_or_else(|| {
+        panic!(
+            "failed to parse .osu fixture for {}: {}",
+            case.name,
+            osu_path.display()
+        )
+    });
+    let mods = test_mods(case.mod_tokens, case.target_mode);
+    let converted = convert(&beatmap, case.target_mode, mods.as_ref())
+        .unwrap_or_else(|error| panic!("conversion failed for {}: {error}", case.name));
+    let expected = read_fixture(&golden_path);
+    let actual = snapshot(&converted);
+    assert_eq!(actual, expected, "golden mismatch for {}", case.name);
+}
+
+fn convert(
+    beatmap: &Beatmap,
+    target_mode: i32,
+    mods: Option<&ModSettings>,
+) -> crate::domain::errors::Result<Beatmap> {
+    match target_mode {
+        1 => crate::domain::rulesets::taiko::taiko_convert(beatmap, target_mode, mods),
+        2 => crate::domain::rulesets::catch::catch_convert(beatmap, target_mode, mods),
+        3 => crate::domain::rulesets::mania::mania_convert(beatmap, target_mode, mods),
+        _ => panic!("unsupported test target mode: {target_mode}"),
+    }
+}
+
+fn test_mods(tokens: &[&str], target_mode: i32) -> Option<ModSettings> {
+    if tokens.is_empty() {
+        return None;
+    }
+    let tokens: Vec<String> = tokens.iter().map(|token| (*token).to_string()).collect();
+    let settings = parse_mods(&tokens).expect("test mod tokens must be valid");
+    Some(mods_for_mode(&settings, target_mode))
+}
+
+fn snapshot(beatmap: &Beatmap) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("mode={}\n", beatmap.mode()));
+    output.push_str(&format!(
+        "circle_size={}\n",
+        beatmap.difficulty.get("CircleSize").unwrap_or("")
+    ));
+    output.push_str(&format!(
+        "timing_points_count={}\n",
+        beatmap.timing_points.len()
+    ));
+    output.push_str("timing_points:\n");
+    for point in &beatmap.timing_points {
+        // 采样组/音量字段只服务打击音，正确性由 hitsound 模块的测试覆盖。
+        // time 用 Debug 输出以保留 f64 的小数点形式。
+        output.push_str(&format!(
+            "TimingPoint {{ time: {:?}, beat_length: {:?}, meter: {}, uninherited: {}, kiai_mode: {}, omit_first_bar_line: {} }}\n",
+            point.time,
+            point.beat_length,
+            point.meter,
+            point.uninherited,
+            point.kiai_mode,
+            point.omit_first_bar_line
+        ));
+    }
+    output.push_str(&format!(
+        "hit_objects_count={}\n",
+        beatmap.hit_objects.len()
+    ));
+    output.push_str("hit_objects:\n");
+    // 只快照渲染与转谱会用到的字段：采样表是本次新增的打击音数据，
+    // 它的正确性由 hitsound 模块自己的测试覆盖，不进入转谱 golden。
+    match &beatmap.hit_objects {
+        HitObjects::Taiko(objects) => {
+            for object in objects {
+                output.push_str(&format!(
+                    "TaikoHitObject {{ start_time: {}, end_time: {}, hit_type: {}, hitsound: {} }}\n",
+                    object.start_time, object.end_time, object.hit_type, object.hitsound
+                ));
+            }
+        }
+        HitObjects::Catch(objects) => {
+            for object in objects {
+                output.push_str(&format!(
+                    "CatchHitObject {{ x: {}, y: {}, start_time: {}, end_time: {}, hit_type: {}, new_combo: {}, combo_offset: {}, slider_type: {:?}, slider_points: {:?}, slider_repeats: {}, slider_pixel_length: {:?} }}\n",
+                    object.x,
+                    object.y,
+                    object.start_time,
+                    object.end_time,
+                    object.hit_type,
+                    object.new_combo,
+                    object.combo_offset,
+                    object.slider_type,
+                    object.slider_points,
+                    object.slider_repeats,
+                    object.slider_pixel_length
+                ));
+            }
+        }
+        HitObjects::Mania(objects) => {
+            for object in objects {
+                output.push_str(&format!("{object:?}\n"));
+            }
+        }
+        HitObjects::Standard(_) => panic!("conversion result is still Standard"),
+    }
+    output
+}
+
+#[test]
+fn conversion_3451313_mania_all_key_counts_succeed() {
+    let osu = read_fixture(&fixture_path("3451313.osu"));
+    let beatmap = crate::domain::parser::parse_beatmap_str_for_tests(&osu)
+        .expect("3451313.osu fixture must parse");
+    for keys in 1..=10 {
+        for tokens in [
+            vec![format!("{keys}K")],
+            vec![format!("{keys}K"), "DS".into()],
+        ] {
+            let settings = parse_mods(&tokens).expect("test mod tokens must be valid");
+            let mods = mods_for_mode(&settings, 3);
+            convert(&beatmap, 3, Some(&mods)).unwrap_or_else(|error| {
+                panic!("conversion failed for 3451313 with {tokens:?}: {error}")
+            });
+        }
+    }
+    convert(&beatmap, 3, None).expect("default mania conversion must succeed");
+}
+
+fn fixture_path(filename: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("testdata_conversion")
+        .join(filename)
+}
+
+fn read_fixture(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read fixture {}: {error}", path.display()))
+        .replace("\r\n", "\n")
+}

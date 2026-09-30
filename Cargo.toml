@@ -10,12 +10,22 @@ repository = "https://github.com/yaowan233/osu-beatmap-preview-py"
 name = "_core"
 crate-type = ["cdylib"]
 
+[workspace]
+members = ["vendor/osu-beatmap-preview-core", "vendor/osu-beatmap-preview-cli"]
+default-members = ["."]
+resolver = "2"
+
 [dependencies]
 # 上游 v1.3.3：固定提交，确保各平台 wheel 使用相同的渲染实现。
 osu-beatmap-preview-core = { git = "https://github.com/2710165659/osu-beatmap-preview", rev = "73b4b9c0ce4d125e614eb38f106e2d0d80a9cb0c" }
 osu-beatmap-preview-cli = { git = "https://github.com/2710165659/osu-beatmap-preview", rev = "73b4b9c0ce4d125e614eb38f106e2d0d80a9cb0c" }
 pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
 serde_json = "1"
+
+[patch."https://github.com/2710165659/osu-beatmap-preview"]
+# CTB HD 与默认红果配色补丁随源码分发，避免只修改本机的 Cargo 缓存。
+osu-beatmap-preview-core = { path = "vendor/osu-beatmap-preview-core" }
+osu-beatmap-preview-cli = { path = "vendor/osu-beatmap-preview-cli" }
 
 [profile.release]
 codegen-units = 1

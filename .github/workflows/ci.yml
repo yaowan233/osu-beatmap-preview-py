@@ -26,6 +26,7 @@ jobs:
       - run: uv sync --no-install-project
       - run: uv run maturin develop
       - run: uv run pytest
+      - run: cargo test -p osu-beatmap-preview-core -p osu-beatmap-preview-cli
       - run: uv run ruff check .
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings

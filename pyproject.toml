@@ -32,6 +32,7 @@ dev = [
     "maturin>=1.8,<2",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
+    "pillow>=10",
     "ruff>=0.9",
 ]
 
@@ -40,6 +41,7 @@ bindings = "pyo3"
 module-name = "osu_beatmap_preview._core"
 python-source = "python"
 features = ["pyo3/extension-module"]
+include = [{ path = "vendor/**/*", format = "sdist" }]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -4,8 +4,8 @@
 Python 原生扩展。渲染器通过 PyO3 直接运行在 Python 进程内，不需要下载、配置或启动额外的
 可执行文件。
 
-> 当前为早期开发版本。Rust 渲染器使用上游 v1.3.3，固定到具体提交，以确保 Python wheel
-> 在各平台使用相同的渲染行为。
+> 当前为早期开发版本。Rust 渲染器使用固定提交的上游 v1.3.3，core 与 CLI 随仓库分发，
+> 包含 CTB Hidden 和默认红果配色补丁，以确保 Python wheel 在各平台使用相同的渲染行为。
 
 ## 安装
 
@@ -42,6 +42,25 @@ print(result["preview-img"])
 `times` 使用 `+` 分隔多个秒数，也支持 `preview`；`duration_time` 控制 GIF 片段或 MP4
 区间时长。`config` 可传配置文件路径或内联 JSON/YAML，`scale` 用于临时覆盖输出倍率。
 
+### CTB GIF 模组
+
+原生 CTB 和 standard 转 CTB 的 GIF 支持 `hd`、`ez`、`hr`、`dt`、`ht`。
+HD 会让水果、水滴及香蕉在到达判定线前渐隐；支持 `hd+ez`、`hd+hr`、`hd+dt`、`hd+ht`。
+`ez+hr` 和 `dt+ht` 是互斥组合。PNG 静态图支持 EZ、HR，不支持 HD、DT、HT。
+Hyperdash（红果）的外圈默认使用红色 `#FF0000`，可通过 `skin.HYPER_DASH` 配置 RGB 颜色；
+水果本体继续使用谱面 Combo 颜色，HD 渐隐同时作用于本体、白边和红圈。
+
+```python
+result = await generate_preview_async(
+    3994408,
+    format="gif",
+    mods="hd+dt",
+    times="preview",
+    duration_time=3,
+    fps=20,
+)
+```
+
 ### 异步取消与并发
 
 上游 Rust API 当前是同步接口，没有提供取消令牌。取消 `generate_preview_async()` 所在的
@@ -54,6 +73,7 @@ Python task 不会中止已经开始的原生渲染；Bot 集成时应使用 sem
 uv sync
 uv run maturin develop
 uv run pytest
+cargo test -p osu-beatmap-preview-core -p osu-beatmap-preview-cli
 ```
 
 ## 发布
