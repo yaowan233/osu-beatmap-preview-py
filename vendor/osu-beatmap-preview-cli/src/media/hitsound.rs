@@ -7,7 +7,9 @@
 //! CLI 的 MP4 音频是一次性离线混音，所以这里只在需要时解码「时间轴实际引用到」
 //! 的样本，并且任何单个样本解码失败都按静音处理——资源损坏不应该让整次导出失败。
 
-use osu_beatmap_preview_core::hitsound::{referenced_names, SampleData, SampleLibrary};
+use osu_beatmap_preview_core::hitsound::{
+    referenced_names, SampleData, SampleLibrary, NIGHTCORE_SAMPLE_NAMES,
+};
 use osu_beatmap_preview_core::model::Beatmap;
 use osu_beatmap_preview_core::processing::media::{
     entry_extension, normalize_entry_path, sample_entry_matches,
@@ -127,16 +129,23 @@ impl SampleArchive {
 
 /// 为给定谱面构建打击音样本库。
 ///
-/// `beatmap_samples` 为 `Some` 时表示启用谱面自带音效（对应配置项
-/// `ENABLE_BEATMAP_HITSOUND`），传的是该谱面的 OSZ 路径；每个候选名按
-///「OSZ 内同名条目 > 内嵌皮肤」的顺序取字节，两者都没有时跳过（混音阶段按静音处理）。
-/// 为 `None` 时只用内嵌资源。
-///
-/// 只解包时间轴引用到的那几十个短音效，所以不需要截止时间：整体耗时在毫秒级。
-pub(crate) fn build_library(beatmap: &Beatmap, beatmap_samples: Option<&Path>) -> SampleLibrary {
+/// `beatmap_samples` 为 `Some` 时启用谱面自带音效（`ENABLE_BEATMAP_HITSOUND`，值为该
+/// 谱面的 OSZ 路径）：每个候选名按「OSZ 同名条目 > 内嵌皮肤」取字节，都没有则跳过；
+/// 为 `None` 时只用内嵌资源。`nightcore` 为 `true` 时把 NC 的 4 个鼓点样本名也纳入
+/// 候选。只解包时间轴引用到的几十个短音效（毫秒级），因此不需要截止时间。
+pub(crate) fn build_library(
+    beatmap: &Beatmap,
+    beatmap_samples: Option<&Path>,
+    nightcore: bool,
+) -> SampleLibrary {
     let mut archive = beatmap_samples.and_then(SampleArchive::open);
     let mut library = SampleLibrary::new();
-    for name in referenced_names(beatmap) {
+    let drum_names = nightcore
+        .then_some(NIGHTCORE_SAMPLE_NAMES)
+        .into_iter()
+        .flatten()
+        .map(str::to_string);
+    for name in referenced_names(beatmap).into_iter().chain(drum_names) {
         if let Some(archive) = archive.as_mut() {
             if let Some(index) = archive.find(&name) {
                 if let Some((bytes, extension)) = archive.extract(index) {
@@ -153,9 +162,8 @@ pub(crate) fn build_library(beatmap: &Beatmap, beatmap_samples: Option<&Path>) -
             continue;
         };
         match decode_sample(&name, bytes, Some("ogg")) {
-            // 解码失败按静音处理：单个坏文件不应该让整次导出失败。
-            // 这里刻意不写日志——日志是全局单例，媒体层的坏样本属于预期情况，
-            // 交给调用方按需统计即可。
+            // 解码失败按静音处理：单个坏文件不应该让整次导出失败。刻意不写日志——
+            // 日志是全局单例，媒体层的坏样本属于预期情况，交给调用方按需统计。
             Ok(sample) => library.insert(name, sample),
             Err(_) => continue,
         }
@@ -249,11 +257,8 @@ fn decode_sample(name: &str, bytes: &[u8], extension: Option<&str>) -> Result<Sa
         sample_rate = default_sample_rate();
     }
     let frames = stereo.len() / 2;
-    let loop_length = if name.contains("sliderslide") || name == "spinnerspin" {
-        frames
-    } else {
-        0
-    };
+    // 哪些样本要循环由 core 统一判定（与 Web 的 WASM 解码共用同一规则）。
+    let loop_length = osu_beatmap_preview_core::hitsound::sample_loop_len(name, frames);
     Ok(SampleData::stereo(stereo, sample_rate).with_loop(loop_length))
 }
 
@@ -336,11 +341,11 @@ mod tests {
             .expect("fixture 必须可解析")
     }
 
-    /// 内嵌样本表覆盖四模式全部打击音。
+    /// 内嵌样本表覆盖四模式全部打击音与 NC 的节拍鼓点。
     #[test]
     fn embedded_sample_table_covers_all_modes() {
         // 资源目录下的 ogg 全部内嵌：缺一个都会让某个模式的某个音效静音。
-        assert_eq!(embedded::HITSOUND_ASSETS.len(), 36);
+        assert_eq!(embedded::HITSOUND_ASSETS.len(), 40);
         for name in [
             "normal-hitnormal",
             "normal-sliderslide",
@@ -350,6 +355,10 @@ mod tests {
             "spinnerbonus",
             "taiko-normal-hitnormal",
             "spinnerbonus-max",
+            "nightcore-hat",
+            "nightcore-clap",
+            "nightcore-kick",
+            "nightcore-finish",
         ] {
             assert!(has_embedded(name), "缺少内嵌样本 {name}");
         }
@@ -421,8 +430,8 @@ mod tests {
         );
         let beatmap = beatmap_with_custom_samples();
 
-        let with_beatmap = build_library(&beatmap, Some(&osz));
-        let embedded_only = build_library(&beatmap, None);
+        let with_beatmap = build_library(&beatmap, Some(&osz), false);
+        let embedded_only = build_library(&beatmap, None, false);
 
         let overridden = with_beatmap.get("soft-hitnormal").expect("必须解析出音效");
         assert_eq!(overridden.sample_rate, 8_000);
@@ -454,11 +463,30 @@ mod tests {
     fn still_usable_without_archive_or_with_partial_entries() {
         // 关闭谱面音效（`None`）与压缩包打不开都必须退化成内嵌资源，而不是空库。
         let beatmap = beatmap_with_custom_samples();
-        let embedded_only = build_library(&beatmap, None);
+        let embedded_only = build_library(&beatmap, None, false);
         assert!(!embedded_only.is_empty());
 
-        let missing = build_library(&beatmap, Some(Path::new("不存在的.osz")));
+        let missing = build_library(&beatmap, Some(Path::new("不存在的.osz")), false);
         assert_eq!(missing.len(), embedded_only.len());
+
+        // 开启 NC 时多装载 4 个节拍鼓点样本（它们同样来自内嵌皮肤）。
+        let with_drums = build_library(&beatmap, None, true);
+        assert_eq!(
+            with_drums.len(),
+            embedded_only.len() + NIGHTCORE_SAMPLE_NAMES.len()
+        );
+        for name in NIGHTCORE_SAMPLE_NAMES {
+            assert!(with_drums.contains(name), "缺少内嵌鼓点 {name}");
+        }
+        // 谱面包里的同名鼓点条目同样优先。
+        let dir = temp_dir("nightcore-override");
+        let osz = dir.join("fixture.osz");
+        let custom = wav_bytes(8_000, 4);
+        write_osz(&osz, &[("Nightcore-Kick.WAV", &custom)]);
+        let overridden = build_library(&beatmap, Some(&osz), true);
+        let kick = overridden.get("nightcore-kick").expect("必须解析出鼓点");
+        assert_eq!(kick.sample_rate, 8_000);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 各模式引用的样本名都能找到内嵌资源。
@@ -530,6 +558,7 @@ mod tests {
             hit_objects: HitObjects::Standard(Vec::new()),
             break_periods: Vec::new(),
             background_filename: None,
+            video: None,
             combo_colors: Vec::new(),
             beat_divisor: 0,
         };

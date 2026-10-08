@@ -244,13 +244,10 @@ pub fn prepare_mania_gif_frames(
 
     let hold_colors: Vec<Rgba> = palette.iter().map(|&c| darken(c, 0.5)).collect();
 
-    // 预计算每个音符的滚动距离位置，供排序后的二分查找裁剪使用。
-    // position_at 随时间严格单调（所有滚动倍率都大于 0），hit_objects 又按
-    // start_time 排序，因此 `pos_start` 为升序。
-    //
-    // 可变 SV 下必须按滚动距离而不是谱面时间裁剪：时间与位置并非线性关系，
-    // 慢 SV 会把很长的谱面时间压缩到少量屏幕像素，按时间窗口会误删可见音符。
-    // 距离通过常量 `pixels_per_scroll_unit` 映射到 y，因此任意 SV 下都保持精确。
+    // 预计算每个音符的滚动距离位置，供排序后的二分查找裁剪使用：position_at 随时间
+    // 严格单调、hit_objects 按 start_time 排序，因此 `pos_start` 升序。可变 SV 下必须
+    // 按滚动距离而不是谱面时间裁剪——时间与位置非线性，慢 SV 会把很长的谱面时间压缩
+    // 到少量屏幕像素，按时间窗口会误删可见音符。
     let pos_start: Vec<f64> = hit_objects
         .iter()
         .map(|ho| scroll_map.position_at(ho.start_time as f64))
@@ -974,19 +971,13 @@ fn y_at_position(
         - round_half_even(distance * pixels_per_scroll_unit)
 }
 
-/// 滚动距离窗口 `[lo, hi]`，窗口外不可能有可见音符。
-/// 用它二分查找预计算的 `pos_start` 数组，避免每帧扫描全部音符。
+/// 滚动距离窗口 `[lo, hi]`，窗口外不可能有可见音符；用它二分查找预计算的
+/// `pos_start` 数组，避免每帧扫描全部音符。
 ///
-/// 窗口单位是滚动距离（position_at），不是谱面时间。可变 SV 使时间与位置非线性：
-/// 慢 SV 会把很长的谱面时间压缩到少量屏幕像素，基于时间的窗口会丢弃屏幕内音符。
-/// 距离通过 `pixels_per_scroll_unit` 映射到屏幕 y，因此任意 SV 下都保持精确。
-/// `lo`/`hi` 覆盖游戏区域并额外留出 `note_head_height`，避免头部/主体在边缘突现。
-///
-/// 从下界减去 `max_hold_position`（距离空间中最宽的长按主体），防止长按被截断：
-/// `end_time` 仍在屏幕内的长按，其 `start_time` 在距离上可能早得多。
-/// 由于 `pos_start >= pos_end - max_hold_position` 且
-/// `pos_end >= snapshot_pos - past_dist`，可得 `pos_start >= lo`，
-/// partition_point 会保留该音符。`draw_gif_hit_object` 内部仍执行 y 裁剪以保证像素精度。
+/// 单位是滚动距离（position_at）而非谱面时间：可变 SV 下时间与位置非线性，基于
+/// 时间的窗口会丢弃屏幕内音符。`lo`/`hi` 覆盖游戏区域并额外留出 `note_head_height`，
+/// 下界再减去 `max_hold_position`（距离空间中最宽的长按主体），保证 `end_time` 仍
+/// 在屏幕内的长按不被截断。`draw_gif_hit_object` 内部仍做 y 裁剪保证像素精度。
 #[inline]
 pub fn visible_pos_window(
     snapshot_pos: f64,
@@ -1157,6 +1148,35 @@ fn draw_gif_sv_indicators_fast(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 多段 GIF 布局下段左边界可以为负（页边距大于段宽）：FL 遮罩必须只作用于
+    /// 画布内的像素，光圈带外压暗、带内保持原样，且负原点不能让下标回绕。
+    #[test]
+    fn flashlight_mask_with_negative_segment_left_stays_inside_canvas() {
+        let layout = test_layout();
+        let timeline = mania_visibility_timeline(&[], &[]);
+        let mut canvas = Img::new(
+            layout.image_width as u32,
+            layout.image_height as u32,
+            [200; 4],
+        );
+        let left = -40;
+        let rect = crate::render::geometry::PixelRect {
+            x: left,
+            y: 0,
+            width: layout.segment_width,
+            height: layout.playfield_height,
+        };
+        mania_flashlight(&timeline, 0, &layout, left).apply(&mut canvas, rect);
+        // 光圈带中心（段中心 = -40 + 50 = 10、y = 20 + 384 = 404）保持原样。
+        assert_eq!(canvas.get(0, 404), [200; 4]);
+        // 带外（画布内仍被覆盖的行）被压暗。
+        assert_eq!(canvas.get(0, 0), [0, 0, 0, 255]);
+        // 段右边界（-40 + 100 = 60）之外不越界写入：更右侧的像素仍是原色。
+        assert_eq!(canvas.get(59, 0), [0, 0, 0, 255]);
+        assert_eq!(canvas.get(60, 0), [200; 4]);
+        assert_eq!(canvas.get(canvas.w - 1, 0), [200; 4]);
+    }
 
     #[test]
     fn hidden_fades_hold_body_and_head_without_covering_judgement_line() {

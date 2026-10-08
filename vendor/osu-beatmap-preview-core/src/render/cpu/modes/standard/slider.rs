@@ -2,7 +2,7 @@
 
 use crate::domain::models::StandardHitObject;
 use crate::domain::shared::slider_path::{
-    build_path, build_standard_slider_path, path_position_at, SliderPath,
+    build_path, build_standard_slider_paths, path_position_at, slice_path, SliderPath,
 };
 use crate::render::canvas::Img;
 use std::collections::HashMap;
@@ -17,10 +17,25 @@ use super::context::{
 
 pub struct SliderRenderData {
     pub frame_path: SliderPath,
+    /// 滑条球、tick 和蛇入/蛇出的端点使用完整曲线，避免显示简化吞掉局部停顿。
+    pub timing_path: SliderPath,
     pub head_center: (f64, f64),
     pub reverse_centers: Vec<(f64, f64)>,
     pub reverse_angles: Vec<f64>,
     pub ticks: Vec<SliderTickRenderData>,
+}
+
+impl SliderRenderData {
+    /// 蛇入/蛇出仍使用稀疏主体，但切割端点必须与完整计时曲线的滑条球一致。
+    pub fn body_path(&self, start: f64, end: f64) -> Vec<(f64, f64)> {
+        let mut points = slice_path(&self.frame_path, start, end);
+        if points.len() >= 2 {
+            points[0] = path_position_at(&self.timing_path, start.min(end));
+            let last = points.len() - 1;
+            points[last] = path_position_at(&self.timing_path, start.max(end));
+        }
+        points
+    }
 }
 
 pub struct SliderTickRenderData {
@@ -220,9 +235,17 @@ pub fn get_slider_render_data(
         return Arc::clone(cached);
     }
 
+    let data = context
+        .body_layers
+        .slider_data(index, || build_slider_render_data(context, index));
+    cache.slider_data.insert(index, Arc::clone(&data));
+    data
+}
+
+fn build_slider_render_data(context: &RenderContext, index: usize) -> SliderRenderData {
     let hit_object = &context.hit_objects[index];
     let slider_type = hit_object.slider_type.as_deref().unwrap_or("B");
-    let world_path = build_standard_slider_path(
+    let (world_path, timing_world_path) = build_standard_slider_paths(
         hit_object.x,
         hit_object.y,
         &hit_object.slider_points,
@@ -235,21 +258,48 @@ pub fn get_slider_render_data(
         .iter()
         .map(|&(x, y)| to_frame_point(x + offset, y + offset, &context.frame_layout))
         .collect();
-    let frame_path = build_path(&frame_points);
+    // 显示点虽然稀疏，累计进度仍来自完整曲线；统一缩放不会改变弧长比例。
+    let frame_path = SliderPath {
+        points: frame_points,
+        cumulative_lengths: world_path
+            .cumulative_lengths
+            .iter()
+            .map(|length| length * context.frame_layout.scale)
+            .collect(),
+        total_length: world_path.total_length * context.frame_layout.scale,
+    };
+    let timing_frame_points: Vec<(f64, f64)> = timing_world_path
+        .points
+        .iter()
+        .map(|&(x, y)| to_frame_point(x + offset, y + offset, &context.frame_layout))
+        .collect();
+    let timing_path = SliderPath {
+        points: timing_frame_points,
+        cumulative_lengths: timing_world_path
+            .cumulative_lengths
+            .iter()
+            .map(|length| length * context.frame_layout.scale)
+            .collect(),
+        total_length: timing_world_path.total_length * context.frame_layout.scale,
+    };
 
+    let (beat_length, slider_velocity) = context
+        .slider_timings
+        .get(index)
+        .copied()
+        .unwrap_or((500.0, 1.0));
     let ticks = generate_slider_ticks(
-        &frame_path,
-        world_path.total_length,
-        hit_object.start_time,
-        hit_object.end_time,
-        hit_object.slider_repeats,
-        context
-            .slider_timings
-            .get(index)
-            .copied()
-            .unwrap_or((500.0, 1.0)),
-        context.slider_tick_rate,
-        context.slider_multiplier,
+        &timing_path,
+        SliderTickParams {
+            world_length: timing_world_path.total_length,
+            start_time: hit_object.start_time,
+            end_time: hit_object.end_time,
+            repeats: hit_object.slider_repeats,
+            beat_length,
+            slider_velocity,
+            tick_rate: context.slider_tick_rate,
+            slider_multiplier: context.slider_multiplier,
+        },
         context.settings.preempt_ms as f64,
     );
 
@@ -279,15 +329,33 @@ pub fn get_slider_render_data(
     }
 
     let head_center = frame_path.points.first().copied().unwrap_or((0.0, 0.0));
-    let data = Arc::new(SliderRenderData {
+    SliderRenderData {
         frame_path,
+        timing_path,
         head_center,
         reverse_centers,
         reverse_angles,
         ticks,
-    });
-    cache.slider_data.insert(index, Arc::clone(&data));
-    data
+    }
+}
+
+/// 滑条 tick 生成参数：路径长度、时间跨度与速度配置打包成结构体，
+/// 供画面 tick 与打击音 tick 共用同一套 osu! 规则，也避免长参数列表传错位。
+///
+/// 时间均为绝对谱面毫秒；`repeats` 的 span 数按 `repeats.max(1)` 计算；
+/// `tick_rate` / `slider_multiplier` 即谱面的 SliderTickRate / SliderMultiplier。
+#[derive(Debug, Clone, Copy)]
+pub struct SliderTickParams {
+    pub world_length: f64,
+    pub start_time: i64,
+    pub end_time: i64,
+    pub repeats: i32,
+    /// 当前 timing point 的拍长（毫秒）。
+    pub beat_length: f64,
+    /// 当前 timing point 的滑条速度倍率（SV）。
+    pub slider_velocity: f64,
+    pub tick_rate: f64,
+    pub slider_multiplier: f64,
 }
 
 /// 计算滑条 tick 的出现时间（毫秒，绝对谱面时间）。
@@ -295,48 +363,32 @@ pub fn get_slider_render_data(
 /// 打击音只需要时间序列，不需要路径几何，因此用一条最短路径复用
 /// [`generate_slider_ticks`]，保证画面 tick 与声音 tick 使用同一套 osu! 规则。
 #[allow(clippy::too_many_arguments)]
-pub fn slider_tick_times(
-    world_length: f64,
-    start_time: i64,
-    end_time: i64,
-    repeats: i32,
-    beat_length: f64,
-    slider_velocity: f64,
-    tick_rate: f64,
-    slider_multiplier: f64,
-) -> Vec<f64> {
+pub fn slider_tick_times(params: SliderTickParams) -> Vec<f64> {
     let dummy_path = build_path(&[(0.0, 0.0), (1.0, 0.0)]);
-    generate_slider_ticks(
-        &dummy_path,
-        world_length,
-        start_time,
-        end_time,
-        repeats,
-        (beat_length, slider_velocity),
-        tick_rate,
-        slider_multiplier,
-        0.0,
-    )
-    .into_iter()
-    .map(|tick| tick.time)
-    .collect()
+    generate_slider_ticks(&dummy_path, params, 0.0)
+        .into_iter()
+        .map(|tick| tick.time)
+        .collect()
 }
 
 /// 按 osu! SliderEventGenerator 规则生成可视化 tick。
 #[allow(clippy::too_many_arguments)]
 fn generate_slider_ticks(
     frame_path: &SliderPath,
-    world_length: f64,
-    start_time: i64,
-    end_time: i64,
-    repeats: i32,
-    timing: (f64, f64),
-    tick_rate: f64,
-    slider_multiplier: f64,
+    params: SliderTickParams,
     object_preempt: f64,
 ) -> Vec<SliderTickRenderData> {
+    let SliderTickParams {
+        world_length,
+        start_time,
+        end_time,
+        repeats,
+        beat_length,
+        slider_velocity,
+        tick_rate,
+        slider_multiplier,
+    } = params;
     let span_count = repeats.max(1) as usize;
-    let (beat_length, slider_velocity) = timing;
     if !world_length.is_finite()
         || world_length <= 0.0
         || !beat_length.is_finite()
@@ -604,7 +656,7 @@ pub fn draw_slider_ball(
         / (hit_object.end_time - hit_object.start_time).max(1) as f64;
     let progress =
         super::alpha::slider_path_progress(hit_object.slider_repeats.max(1) as i64, completion);
-    let center = path_position_at(&slider_data.frame_path, progress);
+    let center = path_position_at(&slider_data.timing_path, progress);
 
     {
         let follow = cache
@@ -652,7 +704,7 @@ pub fn draw_slider_ball(
         // 方向箭头为白色，与游戏一致：不随 combo 颜色变化，只按角度缓存旋转结果。
         // 角度取整到 1°，与折返箭头一致地复用精灵。
         let Some(angle) = slider_ball_arrow_angle(
-            &slider_data.frame_path,
+            &slider_data.timing_path,
             hit_object.slider_repeats.max(1) as i64,
             completion,
         ) else {
@@ -815,8 +867,7 @@ pub fn build_reverse_arrow(circle_diameter: i64, color: [u8; 3]) -> Img {
         true,
     );
 
-    // 深色 `»` 图标：C# Argon = accent.Darken(4)
-    // 图标高度约为胶囊高的 60%（原 72%，缩小一点）
+    // 深色 `»` 图标：C# Argon = accent.Darken(4)，图标高度约为胶囊高的 60%。
     let dark = darken(color, 4.0);
     let dark_rgba = [dark[0], dark[1], dark[2], 255];
     let chev_h = cap_h * 0.60;
@@ -952,23 +1003,75 @@ pub fn draw_ring_aa(img: &mut Img, cx: f64, cy: f64, outer_r: f64, thickness: f6
 mod tests {
     use super::*;
 
+    #[test]
+    fn dense_slider_render_data_is_shared_and_scale_independent() {
+        use super::super::context::build_render_context;
+        use crate::domain::models::HitObjects;
+        use crate::domain::parser::parse_beatmap_bytes;
+        use crate::domain::shared::time_selection::TimeAxis;
+        use crate::render::geometry::OutputFormat;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/testdata_slider");
+        for file in ["4858443.osu", "5467386.osu"] {
+            let beatmap = parse_beatmap_bytes(&std::fs::read(root.join(file)).unwrap()).unwrap();
+            let HitObjects::Standard(objects) = &beatmap.hit_objects else {
+                panic!("需要 standard 谱面")
+            };
+            let index = objects
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, object)| object.slider_points.len())
+                .unwrap()
+                .0;
+            for format in [OutputFormat::Png, OutputFormat::Gif, OutputFormat::Mp4] {
+                let context =
+                    build_render_context(&beatmap, objects.clone(), None, TimeAxis::new(0), format);
+                let first = get_slider_render_data(&mut RenderCache::default(), &context, index);
+                let second = get_slider_render_data(&mut RenderCache::default(), &context, index);
+                assert!(Arc::ptr_eq(&first, &second));
+                assert!(
+                    (first.timing_path.total_length / context.frame_layout.scale
+                        - objects[index].slider_pixel_length)
+                        .abs()
+                        < 1e-6
+                );
+                for start in [0.0, 0.1, 0.5, 0.9] {
+                    let body = first.body_path(start, 0.95);
+                    assert_eq!(
+                        body.first().copied(),
+                        Some(path_position_at(&first.timing_path, start))
+                    );
+                    assert_eq!(
+                        body.last().copied(),
+                        Some(path_position_at(&first.timing_path, 0.95))
+                    );
+                }
+            }
+        }
+    }
+
     fn path(length: f64) -> SliderPath {
         build_path(&[(0.0, 0.0), (length, 0.0)])
     }
 
+    /// 测试用的 tick 参数（测试辅助）：固定 0→1000ms、拍长 500、SV 1.0、SliderMultiplier 1.4。
+    #[cfg(test)]
+    fn tick_params(world_length: f64, repeats: i32, tick_rate: f64) -> SliderTickParams {
+        SliderTickParams {
+            world_length,
+            start_time: 0,
+            end_time: 1000,
+            repeats,
+            beat_length: 500.0,
+            slider_velocity: 1.0,
+            tick_rate,
+            slider_multiplier: 1.4,
+        }
+    }
+
     #[test]
     fn slider_ticks_follow_tick_distance_and_time() {
-        let ticks = generate_slider_ticks(
-            &path(100.0),
-            100.0,
-            0,
-            1000,
-            1,
-            (500.0, 1.0),
-            2.0,
-            1.4,
-            800.0,
-        );
+        let ticks = generate_slider_ticks(&path(100.0), tick_params(100.0, 1, 2.0), 800.0);
         assert_eq!(ticks.len(), 1);
         assert!((ticks[0].center.0 - 70.0).abs() < 1e-9);
         assert!((ticks[0].time - 700.0).abs() < 1e-9);
@@ -977,17 +1080,7 @@ mod tests {
 
     #[test]
     fn repeated_slider_ticks_reverse_time_progress() {
-        let ticks = generate_slider_ticks(
-            &path(100.0),
-            100.0,
-            0,
-            1000,
-            2,
-            (500.0, 1.0),
-            2.0,
-            1.4,
-            800.0,
-        );
+        let ticks = generate_slider_ticks(&path(100.0), tick_params(100.0, 2, 2.0), 800.0);
         assert_eq!(ticks.len(), 2);
         assert!((ticks[0].time - 350.0).abs() < 1e-9);
         assert!((ticks[1].time - 650.0).abs() < 1e-9);
@@ -996,34 +1089,13 @@ mod tests {
 
     #[test]
     fn slider_ticks_skip_points_near_span_end() {
-        let ticks = generate_slider_ticks(
-            &path(142.0),
-            142.0,
-            0,
-            1000,
-            1,
-            (500.0, 1.0),
-            2.0,
-            1.4,
-            800.0,
-        );
+        let ticks = generate_slider_ticks(&path(142.0), tick_params(142.0, 1, 2.0), 800.0);
         assert_eq!(ticks.len(), 1);
     }
 
     #[test]
     fn invalid_tick_inputs_generate_no_ticks() {
-        assert!(generate_slider_ticks(
-            &path(100.0),
-            100.0,
-            0,
-            1000,
-            1,
-            (500.0, 1.0),
-            0.0,
-            1.4,
-            800.0,
-        )
-        .is_empty());
+        assert!(generate_slider_ticks(&path(100.0), tick_params(100.0, 1, 0.0), 800.0).is_empty());
     }
 
     #[test]

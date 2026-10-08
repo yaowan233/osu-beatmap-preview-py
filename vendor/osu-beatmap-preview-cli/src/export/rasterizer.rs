@@ -1,11 +1,12 @@
 //! 场景的 CPU 参考光栅器，复用现有 `Img` 绘图原语。
 
 #![cfg(test)]
-// 保留上游要求的模块与文件双重测试门控。
+// 保留独立文件与模块入口的双层测试门控，兼容固定工具链的严格检查。
 #![allow(clippy::duplicated_attributes)]
 
 use crate::export::canvas::Img;
 use crate::export::scene::{DrawCommand, FrameScene, SceneRect};
+use osu_beatmap_preview_core::storyboard::{draw_transformed_sprite, SpriteTransform};
 use osu_beatmap_preview_core::support::error::{PreviewError, Result};
 
 pub(crate) trait FrameBackend {
@@ -65,6 +66,46 @@ impl FrameBackend for CpuRasterizer {
                         destination.x.round() as i64,
                         destination.y.round() as i64,
                         *clips.last().expect("裁剪栈始终非空"),
+                    );
+                }
+                // 外部纹理槽位（浏览器视频帧 GPU 直拷）只存在于 GPU 渲染器；
+                // CPU 参考光栅器没有对应像素，跳过即可（实时路径不经过这里）。
+                DrawCommand::ExternalSprite { .. } => {}
+                DrawCommand::TransformedSprite {
+                    resource,
+                    position,
+                    origin,
+                    size,
+                    rotation,
+                    color,
+                    additive,
+                } => {
+                    let source = scene.resources.get(resource).ok_or_else(|| {
+                        PreviewError::render(format!(
+                            "frame scene resource {} is missing",
+                            resource.0
+                        ))
+                    })?;
+                    // 与 GPU 光栅器同一套几何语义：直接复用 core 的故事板光栅。
+                    let clip = *clips.last().expect("裁剪栈始终非空");
+                    let sprite = SpriteTransform {
+                        position: *position,
+                        size: *size,
+                        origin: *origin,
+                        rotation: *rotation,
+                        colour: [
+                            f32::from(color[0]) / 255.0,
+                            f32::from(color[1]) / 255.0,
+                            f32::from(color[2]) / 255.0,
+                        ],
+                        alpha: f32::from(color[3]) / 255.0,
+                        additive: *additive,
+                    };
+                    draw_transformed_sprite(
+                        &mut target,
+                        source,
+                        &sprite,
+                        [clip.x, clip.y, clip.x + clip.width, clip.y + clip.height],
                     );
                 }
                 DrawCommand::Rectangle { rect, color } => {
@@ -241,6 +282,184 @@ mod tests {
                 assert_eq!(expected.data, repeated.data);
             }
         }
+    }
+
+    /// FL 必须压暗整个输出画布：lazer 把遮罩加到 `drawableRuleset.Overlays`（整屏），
+    /// MP4 导出同样在整张 16:9 画布上压暗。实时链路一度把物件层画在内容框里，
+    /// 合成阶段补出的背景（playfield 之外）就不会被压暗——表现为「FL 覆盖不全」；
+    /// 另一条同源问题：物件层按 contain 缩放时会在另一轴留下 1~4px 的缝，
+    /// 那条缝同样压不到，看起来是画面边缘的一条亮边。
+    #[test]
+    fn flashlight_darkens_the_whole_canvas_outside_the_playfield() {
+        use osu_beatmap_preview_core::{
+            domain::mods::parse_mods,
+            domain::parser::parse_beatmap_bytes,
+            render::canvas::Img,
+            render::scene::DrawCommand,
+            render::wgpu::{composition::compose_video_scene, VideoStyle},
+        };
+        use std::sync::Arc;
+
+        let cases = [
+            (0, "80,96,1000,1,0,0:0:0:0:\n300,220,1300,1,0,0:0:0:0:\n"),
+            (1, "80,96,1000,1,0,0:0:0:0:\n300,220,1300,1,0,0:0:0:0:\n"),
+            (2, "80,96,1000,1,0,0:0:0:0:\n300,220,1300,1,0,0:0:0:0:\n"),
+            (3, "64,192,1000,1,0,0:0:0:0:\n192,192,1300,1,0,0:0:0:0:\n"),
+        ];
+        // 纯白背景：补边处只要被压暗，像素就会明显变黑。
+        let background = Arc::new(Img::new(2, 2, [255, 255, 255, 255]));
+        for (mode, objects) in cases {
+            let text = format!(
+                "osu file format v14\n\n[General]\nMode:{mode}\n\n[Difficulty]\nCircleSize:4\nApproachRate:6\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,1,0,100,1,0\n\n[HitObjects]\n{objects}"
+            );
+            let beatmap = parse_beatmap_bytes(text.as_bytes()).unwrap();
+            let scene = |mods| {
+                let source = realtime_source(&beatmap, mods);
+                let playfield = source.render(1200).unwrap();
+                let size = (playfield.width(), playfield.height());
+                (
+                    compose_video_scene(
+                        playfield,
+                        1200,
+                        1000,
+                        1280,
+                        720,
+                        Some(&background),
+                        None,
+                        None,
+                        VideoStyle::default(),
+                    )
+                    .unwrap(),
+                    size,
+                )
+            };
+            let flashlight = parse_mods(&["FL".into()]).unwrap();
+            let (plain, _) = scene(None);
+            let (masked, playfield_size) = scene(Some(&flashlight));
+            // 遮罩精灵就是物件层本身（图像尺寸 = 物件层尺寸）：它必须铺满整张画布，
+            // 否则没被盖住的那条缝在 FL 下会露出背景。
+            let mask = masked
+                .commands
+                .iter()
+                .filter_map(|command| match command {
+                    DrawCommand::Sprite {
+                        resource,
+                        destination,
+                        ..
+                    } => Some((&masked.resources[resource], *destination)),
+                    _ => None,
+                })
+                .find(|(image, _)| (image.w, image.h) == playfield_size)
+                .map(|(_, destination)| destination)
+                .expect("FL 必须产出物件层大小的遮罩精灵");
+            assert!(
+                mask.x <= 0.0
+                    && mask.y <= 0.0
+                    && mask.x + mask.width >= 1280.0
+                    && mask.y + mask.height >= 720.0,
+                "mode={mode}：FL 遮罩必须铺满画布，实际 {mask:?}"
+            );
+
+            let frame = |scene| CpuRasterizer.render_frame(&scene).unwrap();
+            let plain = frame(plain);
+            let masked = frame(masked);
+            // 四角都在 playfield 之外（右上角避开合成阶段画上去的时间标签）。
+            for (x, y) in [(4, 4), (1275, 4), (4, 715), (1275, 715)] {
+                assert_eq!(
+                    plain.get(x, y),
+                    [255, 255, 255, 255],
+                    "mode={mode}：基准帧的边缘应是背景原色"
+                );
+                assert_eq!(
+                    masked.get(x, y),
+                    [0, 0, 0, 255],
+                    "mode={mode}：画布边缘必须被 FL 压暗"
+                );
+            }
+        }
+    }
+
+    /// Mania 的 HD/FL 分层必须与 lazer 一致：HD 只改音符层的 alpha
+    /// （lazer 把 `HitObjectContainer` 包进 `PlayfieldCoveringWrapper`），
+    /// FL 是整帧遮罩（`ModFlashlight` 把遮罩加到 `drawableRuleset.Overlays`，
+    /// 压在键道底色和判定线之上，GIF/MP4 导出同理）。
+    /// 这条断言同时阻止两种误改：把 FL 改成"只压暗音符层"，或在仅开 FL 时
+    /// 额外建立音符层并叠加 HD 遮罩。
+    #[test]
+    fn mania_realtime_hidden_and_flashlight_layers_match_lazer() {
+        use osu_beatmap_preview_core::{
+            domain::mods::{parse_mods, ModSettings},
+            domain::parser::parse_beatmap_bytes,
+            render::cpu::modes::mania::animation::{build_video_layout, segment_left},
+            render::cpu::modes::mania::skin::load_mania_skin_config,
+            render::geometry::OutputFormat,
+            render::scene::DrawCommand,
+        };
+        let map = parse_beatmap_bytes(
+            b"osu file format v14\n[General]\nMode:3\n[Difficulty]\nCircleSize:4\nApproachRate:5\n[TimingPoints]\n0,500,4,1,0,100,1,0\n[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n192,192,1500,1,0,0:0:0:0:\n",
+        )
+        .unwrap();
+        // 实时物件层与 MP4 导出一样是 16:9 画布，FL 遮罩因此能盖住整帧。
+        let layout = build_video_layout(
+            &load_mania_skin_config(4, OutputFormat::Mp4),
+            OutputFormat::Mp4,
+        );
+        let left = segment_left(0, &layout);
+        // 键道左侧面板与判定线都在 FL 可视带（playfield 纵向中点 ± 半径）之外。
+        let panel = (
+            (left + layout.left_panel_width / 2) as u32,
+            (layout.playfield_top + 5) as u32,
+        );
+        let judgement = (
+            (left + 5) as u32,
+            (layout.playfield_top + layout.hit_position_y) as u32,
+        );
+        let render = |mods: Option<&ModSettings>| {
+            CpuRasterizer
+                .render_frame(&realtime_source(&map, mods).render(1000).unwrap())
+                .unwrap()
+        };
+        let baseline = render(None);
+        let hd = render(Some(&parse_mods(&["HD".into()]).unwrap()));
+        let fl = render(Some(&parse_mods(&["FL".into()]).unwrap()));
+
+        // HD 只作用于音符层：键道底色与判定线逐像素不变。
+        assert_eq!(hd.get(panel.0, panel.1), baseline.get(panel.0, panel.1));
+        assert_eq!(
+            hd.get(judgement.0, judgement.1),
+            baseline.get(judgement.0, judgement.1)
+        );
+        assert_ne!(hd.data, baseline.data, "HD 必须改变覆盖带内的音符");
+
+        // FL 是整帧遮罩：键道底色与判定线一起被压暗。
+        assert_eq!(fl.get(panel.0, panel.1), [0, 0, 0, 255]);
+        assert_ne!(
+            fl.get(judgement.0, judgement.1),
+            baseline.get(judgement.0, judgement.1)
+        );
+        assert_eq!(fl.get(judgement.0, judgement.1), [0, 0, 0, 255]);
+
+        // 仅开 FL 时不得额外建立音符层：整帧精灵只有 FL 遮罩本身。
+        let full_frame_sprites = realtime_source(&map, Some(&parse_mods(&["FL".into()]).unwrap()))
+            .render(1000)
+            .unwrap()
+            .commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    DrawCommand::Sprite { destination, .. }
+                        if destination.x == 0.0
+                            && destination.y == 0.0
+                            && destination.width == layout.image_width as f32
+                            && destination.height == layout.image_height as f32
+                )
+            })
+            .count();
+        assert_eq!(
+            full_frame_sprites, 1,
+            "仅开 FL 时只应有一个整帧精灵（FL 遮罩），不应额外分层叠加 HD 遮罩"
+        );
     }
 
     #[test]

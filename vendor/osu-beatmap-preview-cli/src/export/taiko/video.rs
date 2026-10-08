@@ -6,7 +6,10 @@
 
 use crate::export::canvas::Img;
 use crate::media::audio::AudioSourceJob;
-use crate::media::{resolve_video_time_range, save_mp4_streamed};
+use crate::media::{
+    frame_time_ms, resolve_video_time_range, save_mp4_streamed, MediaBackground, MediaStoryboard,
+};
+use osu_beatmap_preview_core::hitsound::MusicRate;
 use osu_beatmap_preview_core::model::mods::ModSettings;
 use osu_beatmap_preview_core::model::Beatmap;
 use osu_beatmap_preview_core::processing::timeline::TimeAxis;
@@ -18,8 +21,8 @@ use std::path::Path;
 
 use super::animation_render::{
     build_multiplier_points, build_video_animation_layout, compute_time_range, draw_hit_objects,
-    draw_row_background, prepare_hit_objects_with_mods, prepare_measure_lines, pyround,
-    taiko_flashlight, taiko_visibility_timeline, AnimationLayout, MultiplierLookup,
+    draw_row_background, prepare_hit_objects_with_mods, prepare_measure_lines, taiko_flashlight,
+    taiko_visibility_timeline, AnimationLayout, MultiplierLookup,
 };
 use super::notes::RenderCache;
 use super::timing::*;
@@ -31,7 +34,8 @@ pub(crate) fn render_taiko_video(
     start_time: Option<TimePoint>,
     duration_time: Option<f64>,
     output_path: &Path,
-    background: Option<Img>,
+    background: MediaBackground,
+    storyboard: Option<MediaStoryboard>,
     audio_job: AudioSourceJob,
     time_axis: TimeAxis,
     fps: Option<u32>,
@@ -44,6 +48,9 @@ pub(crate) fn render_taiko_video(
     }
 
     let speed = mods.map(|m| m.speed_multiplier).unwrap_or(1.0);
+    // 音乐在输出域的重采样/时间伸缩倍率：DT/HT 保调，NC/DC 固定 1.5 / 0.75 音高。
+    let music = MusicRate::output_domain(speed, mods.map_or(1.0, ModSettings::music_pitch));
+    let nightcore = mods.is_some_and(|m| m.nightcore);
     let first = hit_objects.iter().map(|h| h.start_time).min().unwrap_or(0);
     let last = hit_objects.iter().map(|h| h.end_time).max().unwrap_or(0);
     let range = resolve_video_time_range(beatmap, first, last, start_time, duration_time, speed)?;
@@ -86,12 +93,14 @@ pub(crate) fn render_taiko_video(
     let static_bg = {
         // 背景图在最终视频画布上统一处理；这里仅绘制 Taiko 自身的轨道面板。
         // 物件层与视频画布同尺寸，底色只填内容带，补边仍由画布底色决定。
+        // 玩法层之下还有内容要透出（背景素材或故事板的 underlay）时不填底色，
+        // 否则会把它们整块盖住。
         let mut bg = Img::new(
             layout.image_width as u32,
             layout.image_height as u32,
             [0, 0, 0, 0],
         );
-        if background.is_none() {
+        if background.needs_playfield_base(storyboard.as_ref()) {
             let content = layout.content;
             bg.fill_rect_size(
                 content.x,
@@ -117,7 +126,7 @@ pub(crate) fn render_taiko_video(
     }
 
     let render = move |frame_index: usize| -> Result<(Img, i64)> {
-        let snapshot_time = start + pyround(frame_index as f64 * 1000.0 * speed / fps as f64);
+        let snapshot_time = frame_time_ms(start, frame_index, speed, fps);
         let mut canvas = static_bg.clone();
         TAIKO_VIDEO_CACHE.with(|cache| {
             draw_hit_objects(
@@ -149,12 +158,15 @@ pub(crate) fn render_taiko_video(
         start,
         last,
         speed,
+        music,
+        nightcore,
         render,
         output_path,
         fps,
         audio_job,
         beatmap.clone(),
         background,
+        storyboard,
         time_axis,
         deadline,
         crate::export::geometry::GameMode::Taiko,

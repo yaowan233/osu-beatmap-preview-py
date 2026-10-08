@@ -6,7 +6,10 @@
 
 use crate::export::canvas::{Img, Rgba};
 use crate::media::audio::AudioSourceJob;
-use crate::media::{resolve_video_time_range, save_mp4_streamed};
+use crate::media::{
+    frame_time_ms, resolve_video_time_range, save_mp4_streamed, MediaBackground, MediaStoryboard,
+};
+use osu_beatmap_preview_core::hitsound::MusicRate;
 use osu_beatmap_preview_core::model::mods::ModSettings;
 use osu_beatmap_preview_core::model::Beatmap;
 use osu_beatmap_preview_core::processing::parse::round_half_even;
@@ -33,7 +36,8 @@ pub(crate) fn render_mania_video(
     start_time: Option<TimePoint>,
     duration_time: Option<f64>,
     output_path: &Path,
-    background: Option<Img>,
+    background: MediaBackground,
+    storyboard: Option<MediaStoryboard>,
     audio_job: AudioSourceJob,
     time_axis: TimeAxis,
     fps: Option<u32>,
@@ -60,6 +64,9 @@ pub(crate) fn render_mania_video(
     }
 
     let speed = mods.map_or(1.0, |m| m.speed_multiplier);
+    // 音乐在输出域的重采样/时间伸缩倍率：DT/HT 保调，NC/DC 固定 1.5 / 0.75 音高。
+    let music = MusicRate::output_domain(speed, mods.map_or(1.0, ModSettings::music_pitch));
+    let nightcore = mods.is_some_and(|m| m.nightcore);
     let first = original_objects
         .iter()
         .map(|h| h.start_time)
@@ -126,12 +133,14 @@ pub(crate) fn render_mania_video(
     let static_bg = {
         // 背景图在最终视频画布上统一处理；这里仅绘制 Mania 轨道和侧板。
         // 物件层与视频画布同尺寸，底色只填内容框，补边仍由画布底色决定。
+        // 玩法层之下还有内容要透出（背景素材或故事板的 underlay）时不填底色，
+        // 否则会把它们整块盖住。
         let mut bg = Img::new(
             layout.image_width as u32,
             layout.image_height as u32,
             [0, 0, 0, 0],
         );
-        if background.is_none() {
+        if background.needs_playfield_base(storyboard.as_ref()) {
             let content = layout.content;
             bg.fill_rect_size(
                 content.x,
@@ -151,8 +160,7 @@ pub(crate) fn render_mania_video(
     };
 
     let render = move |frame_index: usize| -> Result<(Img, i64)> {
-        let snapshot_time =
-            start + round_half_even(frame_index as f64 * 1000.0 * speed / fps as f64);
+        let snapshot_time = frame_time_ms(start, frame_index, speed, fps);
         let snapshot_pos = scroll_map.position_at(snapshot_time as f64);
         let mut canvas = static_bg.clone();
         let mut notes = hidden.then(|| Img::new(canvas.w, canvas.h, [0, 0, 0, 0]));
@@ -217,12 +225,15 @@ pub(crate) fn render_mania_video(
         start,
         last,
         speed,
+        music,
+        nightcore,
         render,
         output_path,
         fps,
         audio_job,
         beatmap.clone(),
         background,
+        storyboard,
         time_axis,
         deadline,
         crate::export::geometry::GameMode::Mania,

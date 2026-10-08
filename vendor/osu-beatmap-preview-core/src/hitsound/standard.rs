@@ -2,12 +2,13 @@
 
 use crate::domain::models::{Beatmap, HitAddition, StandardHitObject};
 use crate::render::cpu::modes::catch::objects::difficulty_range;
+use crate::render::cpu::modes::standard::slider::{slider_tick_times, SliderTickParams};
 
 use super::common::{
     head_sample, push_declared_samples, push_default_samples, slider_timing, HeadSample,
 };
 use super::sample::SampleResolver;
-use super::timeline::{PlayFrequency, TimelineBuilder};
+use super::timeline::{NamedEvent, PlayFrequency, TimelineBuilder};
 
 pub(super) fn push_standard<R: SampleResolver>(
     builder: &mut TimelineBuilder<R>,
@@ -74,16 +75,13 @@ const SPINNER_MAX_ROTATION_MS: f64 = 600_000.0;
 
 /// 转盘：旋转循环音（音高随旋转进度升高）+ 奖励音 + 结束时的判定音。
 ///
-/// 规则与 osu! 一致：
-/// - `Spinner.ApplyDefaultsToSelf` 按 OD 换算「清关所需圈数」与「上限圈数」；
-/// - `Spinner.CreateNestedHitObjects` 生成 `SpinsRequired + 2 + MaximumBonusSpins` 个圈，
-///   前 `SpinsRequired + 2` 个是计分圈（不发声），其余是奖励圈（`spinnerbonus`）；
-/// - 超出上限的圈数用 `spinnerbonus-max`（`DrawableSpinner.updateBonusScore`）；
-/// - `DrawableSpinner.Update` 用 `progressUnclamped`（已转圈数 / 所需圈数）调制旋转音频率；
-/// - 转盘自身的判定音在判定成立（`ArmedState.Hit`）时才播，也就是结束处，而不是出现时。
+/// 与 osu! 一致：按 OD 换算所需/上限圈数（`Spinner.ApplyDefaultsToSelf`），前
+/// `SpinsRequired + 2` 圈计分不发声，之后每圈 `spinnerbonus`、超上限 `spinnerbonus-max`
+/// （`DrawableSpinner.updateBonusScore`）；旋转音频率按 `progressUnclamped` 调制；
+/// 判定音在结束处（`ArmedState.Hit`）而非出现时。
 ///
-/// 这些圈的**发声时刻**由实际旋转决定（每转满一圈响一次），而不是取 `CreateNestedHitObjects`
-/// 里那种「按时长均分」的占位 StartTime，因此这里按 autoplay 的转速换算时刻。
+/// 圈的**发声时刻**由实际旋转决定（每转满一圈响一次），因此按 autoplay 转速换算时刻，
+/// 不取 `CreateNestedHitObjects` 里「按时长均分」的占位 StartTime。
 fn push_standard_spinner<R: SampleResolver>(
     builder: &mut TimelineBuilder<R>,
     object: &StandardHitObject,
@@ -142,31 +140,30 @@ fn push_standard_spinner<R: SampleResolver>(
             break;
         }
         if index >= total_spins as i64 {
-            builder.push_named(
-                head.bank,
-                "spinnerbonus-max",
-                head.custom_bank,
-                head.volume,
-                time,
-                0.0,
-                false,
-            );
+            builder.push_named(NamedEvent {
+                bank: head.bank,
+                name: "spinnerbonus-max",
+                custom_bank: head.custom_bank,
+                volume: head.volume,
+                start_ms: time,
+                duration_ms: 0.0,
+                looping: false,
+            });
         } else if index >= spins_required_for_bonus as i64 {
-            builder.push_named(
-                head.bank,
-                "spinnerbonus",
-                head.custom_bank,
-                head.volume,
-                time,
-                0.0,
-                false,
-            );
+            builder.push_named(NamedEvent {
+                bank: head.bank,
+                name: "spinnerbonus",
+                custom_bank: head.custom_bank,
+                volume: head.volume,
+                start_ms: time,
+                duration_ms: 0.0,
+                looping: false,
+            });
         }
     }
 
     // 判定音：`DrawableHitObject` 只在 `ArmedState.Hit` 时 `PlaySamples()`，而转盘的判定
-    // 成立在结束处（`CheckForResult` 在 `Time.Current < EndTime` 时直接返回），所以它响在
-    // 转盘结束而不是出现时。
+    // 成立在结束处，所以它响在转盘结束而不是出现时。
     push_declared_samples(builder, &object.samples, object.hitsound, beatmap, end);
 }
 
@@ -199,15 +196,15 @@ fn push_standard_slider<R: SampleResolver>(
                 true,
             );
         } else {
-            builder.push_named(
-                head.bank,
-                "sliderslide",
-                head.custom_bank,
-                head.volume,
-                object.start_time as f64,
-                duration,
-                true,
-            );
+            builder.push_named(NamedEvent {
+                bank: head.bank,
+                name: "sliderslide",
+                custom_bank: head.custom_bank,
+                volume: head.volume,
+                start_ms: object.start_time as f64,
+                duration_ms: duration,
+                looping: true,
+            });
         }
         // osu! 只把头部的 whistle 复制为 sliderwhistle，其他加成音不参与滑行循环。
         if head_hitsound & 2 != 0
@@ -230,46 +227,45 @@ fn push_standard_slider<R: SampleResolver>(
                     true,
                 );
             } else {
-                builder.push_named(
-                    head.bank,
-                    "sliderwhistle",
-                    head.custom_bank,
-                    head.volume,
-                    object.start_time as f64,
-                    duration,
-                    true,
-                );
+                builder.push_named(NamedEvent {
+                    bank: head.bank,
+                    name: "sliderwhistle",
+                    custom_bank: head.custom_bank,
+                    volume: head.volume,
+                    start_ms: object.start_time as f64,
+                    duration_ms: duration,
+                    looping: true,
+                });
             }
         }
     }
 
     // 滑条 tick：使用滑条头普通样本的音效组与音量
     //（osu! `Slider.UpdateNestedSamples` 的 `tickSample = 头部普通样本.With("slidertick")`）。
-    let tick_times = crate::render::cpu::modes::standard::slider::slider_tick_times(
-        object.slider_pixel_length,
-        object.start_time,
-        object.end_time,
-        object.slider_repeats,
+    let tick_times = slider_tick_times(SliderTickParams {
+        world_length: object.slider_pixel_length,
+        start_time: object.start_time,
+        end_time: object.end_time,
+        repeats: object.slider_repeats,
         beat_length,
         slider_velocity,
         tick_rate,
         slider_multiplier,
-    );
+    });
     for time in tick_times {
-        builder.push_named(
-            head.bank,
-            "slidertick",
-            head.custom_bank,
-            head.volume,
-            time,
-            0.0,
-            false,
-        );
+        builder.push_named(NamedEvent {
+            bank: head.bank,
+            name: "slidertick",
+            custom_bank: head.custom_bank,
+            volume: head.volume,
+            start_ms: time,
+            duration_ms: 0.0,
+            looping: false,
+        });
     }
 
     // 重复箭头与滑条尾：每个节点用**它自己时刻**的 timing point 补齐音效组 / 音量 /
-    // 自定义索引，音效位掩码取自 `edgeSounds`（缺省时沿用物件自身的 hitsound）。
-    // 谱面常用「在滑条尾插入低音量绿线」压掉尾部音效，靠的正是这一点。
+    // 自定义索引（谱面常用「在滑条尾插低音量绿线」压掉尾部音效，靠的正是这一点）。
     let spans = object.slider_repeats.max(1) as usize;
     let span_duration = (object.end_time - object.start_time) as f64 / spans as f64;
     // edgeSets[1..] 对应重复节点和尾节点，尾节点在没有重复时也必须发声。
@@ -321,7 +317,7 @@ mod tests {
     #[test]
     fn slider_node_params_come_from_node_time_timing_point() {
         // 谱面常用「在滑条尾插入低音量绿线」压掉尾部音效：节点必须按自己的时刻解析音量，
-        // 而不是沿用头部（此前尾部会跟着头部一起用 95% 音量，听起来就是多出一声）。
+        // 而不是沿用头部——否则尾部会跟着头部一起用 95% 音量，听起来就是多出一声。
         let library = library_with(&["soft-hitnormal"]);
         let mut beatmap = beatmap_with(0, HitObjects::Standard(vec![slider(1000, 2000, 2, 0)]));
         beatmap.timing_points = vec![

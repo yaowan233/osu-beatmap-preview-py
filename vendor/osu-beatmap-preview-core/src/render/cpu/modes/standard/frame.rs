@@ -132,6 +132,36 @@ pub fn render_frame(
         draw_break_overlay(&mut frame, current_break, snapshot_time, context);
     }
 
+    if context.show_cursor {
+        if let Some(cache) = &context.autoplay {
+            let cursor = cache.get(context);
+            cursor.visit_trail(
+                snapshot_time,
+                context.frame_layout.scale,
+                |from, to, width, alpha| {
+                    frame.draw_line(
+                        from[0],
+                        from[1],
+                        to[0],
+                        to[1],
+                        width,
+                        [255, 255, 255, alpha],
+                    );
+                },
+            );
+            if let (Some(position), Some(sprite)) = (
+                cursor.position_at(snapshot_time),
+                cursor.sprite_at(snapshot_time),
+            ) {
+                frame.alpha_composite(
+                    sprite,
+                    py_round(position[0] - sprite.w as f64 / 2.0),
+                    py_round(position[1] - sprite.h as f64 / 2.0),
+                );
+            }
+        }
+    }
+
     frame
 }
 
@@ -234,8 +264,7 @@ fn draw_slider(
             context.settings.traceable,
         );
     } else {
-        let visible_path =
-            crate::processing::path::slice_path(&slider_data.frame_path, snaked_start, snaked_end);
+        let visible_path = slider_data.body_path(snaked_start, snaked_end);
         draw_slider_body(
             frame,
             &visible_path,
@@ -307,47 +336,7 @@ fn draw_spinner(
     hit_object: &StandardHitObject,
     snapshot_time: i64,
 ) {
-    let alpha = spinner_alpha(hit_object, snapshot_time, &context.settings);
-    if alpha <= 0.0 {
-        return;
-    }
-    let center = to_frame_point(
-        super::constants::PLAYFIELD_WIDTH / 2.0,
-        super::constants::PLAYFIELD_HEIGHT / 2.0,
-        &context.frame_layout,
-    );
-    let scale = context.spinner_size as f64 / 256.0;
-    let base_r = 80.0 * scale;
-    let alpha_byte = super::slider::alpha_to_byte(alpha);
-
-    let progress = ((snapshot_time - hit_object.start_time) as f64
-        / (hit_object.end_time - hit_object.start_time).max(1) as f64)
-        .clamp(0.0, 1.0);
-    let disc_r = base_r * (0.8 + 0.6 * progress);
-    let pink = super::constants::ARGON_SPINNER_PINK;
-    frame.fill_circle_aa(
-        center.0,
-        center.1,
-        disc_r,
-        [pink[0], pink[1], pink[2], (30.0 * alpha) as u8],
-    );
-
-    draw_ring_aa(
-        frame,
-        center.0,
-        center.1,
-        base_r * 0.8,
-        (10.0 * scale).max(1.0),
-        [255, 255, 255, alpha_byte],
-    );
-    draw_ring_aa(
-        frame,
-        center.0,
-        center.1,
-        base_r,
-        (3.0 * scale).max(1.0),
-        [255, 255, 255, alpha_byte],
-    );
+    super::spinner::draw_cpu(frame, context, hit_object, snapshot_time);
 }
 
 // ——— 接近圈 ———
@@ -579,35 +568,6 @@ fn draw_break_overlay(
         context.frame_layout.frame_width,
     );
 
-    let break_label = format!(
-        "Break {} - {}",
-        crate::render::text::format_mmssmmm(context.time_axis.to_display(break_period.start_time)),
-        crate::render::text::format_mmssmmm(context.time_axis.to_display(break_period.end_time))
-    );
-    let info_y = py_round(center_y)
-        + crate::render::geometry::scale_px(
-            super::constants::BREAK_OVERLAY_INFO_TOP_GAP as f64,
-            render_scale,
-        );
-    let info_color = [
-        super::constants::BREAK_OVERLAY_INFO_COLOR[0],
-        super::constants::BREAK_OVERLAY_INFO_COLOR[1],
-        super::constants::BREAK_OVERLAY_INFO_COLOR[2],
-        py_round(super::constants::BREAK_OVERLAY_INFO_COLOR[3] as f64 * alpha).clamp(0, 255) as u8,
-    ];
-    draw_centered_text(
-        &mut layer,
-        &break_label,
-        0,
-        info_y,
-        crate::render::text::scaled_bitmap_font_height(
-            super::constants::BREAK_OVERLAY_INFO_FONT_SIZE,
-            render_scale,
-        ),
-        info_color,
-        context.frame_layout.frame_width,
-    );
-
     frame.alpha_composite(&layer, 0, 0);
 }
 
@@ -729,6 +689,47 @@ mod tests {
     };
     use crate::render::geometry::OutputFormat;
 
+    /// FL 光圈在任何时刻都必须真实存在：半径有限且为正，光圈中心处保留 `dim` 透明度。
+    ///
+    /// 这条不变量防的是「整屏全黑」——遮罩只有在光圈消失（半径非正/非有限）或中心也被
+    /// 涂满时才会盖住整个画面。断到很大的时间点、休息段、负时间都要成立。
+    #[test]
+    fn flashlight_keeps_a_visible_hole_at_every_time() {
+        let beatmap = edge_circle_beatmap();
+        let mods = crate::domain::mods::ModSettings {
+            flashlight: true,
+            ..crate::domain::mods::ModSettings::new()
+        };
+        let context = build_video_render_context(
+            &beatmap,
+            beatmap.hit_objects.as_standard().unwrap().to_vec(),
+            Some(&mods),
+            TimeAxis::new(0),
+            OutputFormat::Mp4,
+        );
+        let flashlight = context.flashlight.as_ref().unwrap().get(&context);
+        for time in [-10_000, 0, 5_000, 5_200, 30_000, 600_000, i64::MAX / 4] {
+            let mask = flashlight.at(&context, time);
+            assert!(
+                mask.radius.is_finite() && mask.radius > 0.0,
+                "time={time} 的 FL 半径必须为正有限数：{}",
+                mask.radius
+            );
+            assert!(
+                mask.center.iter().all(|value| value.is_finite()),
+                "time={time} 的 FL 中心必须有限：{:?}",
+                mask.center
+            );
+            // 光圈中心：非滑条时段应完全透明，滑条时段保留 dim（80%）暗化。
+            let center_alpha = mask.opacity_at(mask.center[0], mask.center[1]);
+            assert!(
+                (center_alpha as f64 - mask.dim * 255.0).abs() <= 1.0,
+                "time={time} 光圈中心 alpha={center_alpha}，应为 {:.0}",
+                mask.dim * 255.0
+            );
+        }
+    }
+
     #[test]
     fn flashlight_follows_objects_in_scaled_and_centered_video_layouts() {
         let beatmap = edge_circle_beatmap();
@@ -753,9 +754,15 @@ mod tests {
                     .unwrap()
                     .get(&context)
                     .at(&context, 5200);
-                let expected = to_frame_point(0.0, 192.0, &context.frame_layout);
-                assert!((mask.center[0] - expected.0).abs() < 1.0 * scale);
-                assert!((mask.center[1] - expected.1).abs() < 0.01);
+                let expected = context
+                    .autoplay
+                    .as_ref()
+                    .unwrap()
+                    .get(&context)
+                    .flashlight_path(context.spinner_rate)
+                    .position_at(5200);
+                assert!((mask.center[0] - expected[0]).abs() < 0.01);
+                assert!((mask.center[1] - expected[1]).abs() < 0.01);
                 assert_eq!(mask.radius, 125.0 * context.frame_layout.scale);
                 let image = render_single(&context, 5200);
                 assert_eq!(image.get(image.w - 1, 0), [0, 0, 0, 255]);
@@ -785,6 +792,7 @@ mod tests {
             }]),
             break_periods: Vec::new(),
             background_filename: None,
+            video: None,
             combo_colors: Vec::new(),
             beat_divisor: 0,
         }
@@ -865,7 +873,7 @@ mod tests {
         let inside_x = content.x as u32;
         let inside_y = content.y as u32;
         assert_eq!(frame.get(inside_x, inside_y)[3], 255);
-        // 左侧补边必须保持透明，让合成阶段的画布底色透出来（外观与修改前一致）。
+        // 左侧补边必须保持透明，让合成阶段的画布底色透出来。
         assert_eq!(frame.get(inside_x - 1, inside_y)[3], 0);
         assert_eq!(frame.get(frame.w - 1, frame.h - 1)[3], 0);
     }
@@ -918,6 +926,7 @@ mod tests {
             hit_objects: HitObjects::Standard(vec![circle(100, 1000), circle(400, 2000)]),
             break_periods: Vec::new(),
             background_filename: None,
+            video: None,
             combo_colors: Vec::new(),
             beat_divisor: 0,
         }

@@ -98,12 +98,10 @@ pub struct HitSample {
     pub addition: HitAddition,
     pub volume: i32,
     pub filename: Option<String>,
-    /// 自定义音效索引（`.osu` 的 `hitSample` 第 3 列）。
-    ///
-    /// 与 osu! 的 `HitSampleInfo.CustomSampleBank` 同义：0 表示音效来自皮肤；1 表示
-    /// 使用谱面自带的无后缀音效（`soft-hitnormal`）；≥2 表示使用带该索引后缀的音效
-    /// （`soft-hitnormal20`，见 `LegacyHitSampleInfo.Suffix`）。物件没有声明时由所在
-    /// timing point 的 `sample_index` 补齐。
+    /// 自定义音效索引（`.osu` 的 `hitSample` 第 3 列）。与 osu! 的
+    /// `HitSampleInfo.CustomSampleBank` 同义：0 = 皮肤、1 = 谱面自带无后缀音效
+    /// （`soft-hitnormal`）、≥2 = 带该索引后缀的音效（`soft-hitnormal20`）；
+    /// 物件没有声明时由所在 timing point 的 `sample_index` 补齐。
     pub custom_bank: i32,
 }
 
@@ -152,6 +150,15 @@ pub struct TimingPoint {
 pub struct BreakPeriod {
     pub start_time: i64,
     pub end_time: i64,
+}
+
+/// `[Events]` 区段中的背景视频事件（`Video,<start_ms>,"file"` 或旧式 `1,...`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoEvent {
+    /// 视频文件名（反斜杠已归一化为 `/`）。
+    pub filename: String,
+    /// 视频开始播放的谱面时间（毫秒）；负值表示视频在谱面 0 点之前就已开始。
+    pub start_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -352,6 +359,8 @@ pub struct Beatmap {
     pub break_periods: Vec<BreakPeriod>,
     /// `[Events]` 区段中的谱面背景文件名。
     pub background_filename: Option<String>,
+    /// `[Events]` 区段中的背景视频事件；没有视频时为 `None`。
+    pub video: Option<VideoEvent>,
     /// 谱面 [Colours] 区段中的连击颜色（按 Combo1..ComboN 顺序）。
     pub combo_colors: Vec<[u8; 3]>,
     /// [Editor] 区段中的 BeatDivisor，未设置时为 0。
@@ -427,6 +436,7 @@ mod tests {
             hit_objects: HitObjects::Standard(Vec::new()),
             break_periods: Vec::new(),
             background_filename: None,
+            video: None,
             combo_colors: Vec::new(),
             beat_divisor: 0,
         }

@@ -67,7 +67,7 @@ wheels = [
 
 [[package]]
 name = "osu-beatmap-preview-py"
-version = "0.1.8"
+version = "0.1.9"
 source = { editable = "." }
 
 [package.dev-dependencies]

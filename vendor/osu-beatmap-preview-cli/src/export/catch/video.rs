@@ -6,7 +6,10 @@
 
 use crate::export::canvas::Img;
 use crate::media::audio::AudioSourceJob;
-use crate::media::{resolve_video_time_range, save_mp4_streamed};
+use crate::media::{
+    frame_time_ms, resolve_video_time_range, save_mp4_streamed, MediaBackground, MediaStoryboard,
+};
+use osu_beatmap_preview_core::hitsound::MusicRate;
 use osu_beatmap_preview_core::model::mods::ModSettings;
 use osu_beatmap_preview_core::model::Beatmap;
 use osu_beatmap_preview_core::processing::timeline::TimeAxis;
@@ -17,7 +20,6 @@ use std::path::Path;
 
 use super::animation::{build_video_animation_layout, render_animation_frame, CatchFlashlight};
 use super::objects::{build_catch_render_objects, effective_difficulty};
-use super::png::rhe;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_catch_video(
@@ -26,7 +28,8 @@ pub(crate) fn render_catch_video(
     start_time: Option<TimePoint>,
     duration_time: Option<f64>,
     output_path: &Path,
-    background: Option<Img>,
+    background: MediaBackground,
+    storyboard: Option<MediaStoryboard>,
     audio_job: AudioSourceJob,
     time_axis: TimeAxis,
     fps: Option<u32>,
@@ -45,6 +48,9 @@ pub(crate) fn render_catch_video(
         .then(|| CatchFlashlight::new(&render_objects, &beatmap.break_periods));
 
     let speed = mods.map(|m| m.speed_multiplier).unwrap_or(1.0);
+    // 音乐在输出域的重采样/时间伸缩倍率：DT/HT 保调，NC/DC 固定 1.5 / 0.75 音高。
+    let music = MusicRate::output_domain(speed, mods.map_or(1.0, ModSettings::music_pitch));
+    let nightcore = mods.is_some_and(|m| m.nightcore);
     let first = hit_objects.iter().map(|h| h.start_time).min().unwrap_or(0);
     let last = hit_objects.iter().map(|h| h.end_time).max().unwrap_or(0);
     let range = resolve_video_time_range(beatmap, first, last, start_time, duration_time, speed)?;
@@ -59,8 +65,10 @@ pub(crate) fn render_catch_video(
         crate::export::geometry::OutputFormat::Mp4,
     )
     .with_hidden_kiai(beatmap, mods);
-    // 视频背景在最终 16:9 画布上统一处理，playfield 只提供透明对象层。
-    let frame_background = background.as_ref().map(|_| {
+    // 视频背景在最终 16:9 画布上统一处理，playfield 只提供透明对象层；
+    // 背景视频同样垫在画布上，因此只要玩法层之下还有内容要透出（背景素材或
+    // 故事板的 underlay），对象层就保持透明、不自填内容框底色。
+    let frame_background = (!background.needs_playfield_base(storyboard.as_ref())).then(|| {
         Img::new(
             layout.frame_width as u32,
             layout.frame_height as u32,
@@ -71,7 +79,7 @@ pub(crate) fn render_catch_video(
     let start_times: Vec<i64> = render_objects.iter().map(|o| o.start_time).collect();
 
     let render = move |frame_index: usize| -> Result<(Img, i64)> {
-        let snapshot_time = start + rhe(frame_index as f64 * 1000.0 * speed / fps as f64);
+        let snapshot_time = frame_time_ms(start, frame_index, speed, fps);
         let mut frame = render_animation_frame(
             &render_objects,
             &start_times,
@@ -98,12 +106,15 @@ pub(crate) fn render_catch_video(
         start,
         last,
         speed,
+        music,
+        nightcore,
         render,
         output_path,
         fps,
         audio_job,
         beatmap.clone(),
         background,
+        storyboard,
         time_axis,
         deadline,
         crate::export::geometry::GameMode::Catch,

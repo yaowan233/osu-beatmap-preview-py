@@ -22,6 +22,19 @@ pub struct SceneRect {
     pub height: f32,
 }
 
+/// 带组合变换的贴图绘制参数：几何与混合字段同 [`DrawCommand::TransformedSprite`]。
+///
+/// 打包成结构体，避免 [`FrameSceneBuilder::transformed_sprite`] 一长串参数传错位。
+#[derive(Debug, Clone, Copy)]
+pub struct SpriteSpec {
+    pub position: [f32; 2],
+    pub origin: [f32; 2],
+    pub size: [f32; 2],
+    pub rotation: f32,
+    pub color: Rgba,
+    pub additive: bool,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum DrawCommand {
@@ -29,6 +42,30 @@ pub enum DrawCommand {
     PopClip,
     Sprite {
         resource: ResourceId,
+        destination: SceneRect,
+        alpha: f32,
+    },
+    /// 变换精灵：按「锚点 + 尺寸 + 旋转」描述几何，供故事板这类带组合变换的贴图使用；
+    /// CPU 与 WGPU 两条光栅路径按同一套几何语义实现。
+    TransformedSprite {
+        resource: ResourceId,
+        /// 锚点位置（画布坐标）。
+        position: [f32; 2],
+        /// 原点在图像中的归一化偏移（0 / 0.5 / 1，已按翻转调整）。
+        origin: [f32; 2],
+        /// 缩放后的目标尺寸；负值表示翻转。
+        size: [f32; 2],
+        /// 顺时针旋转弧度。
+        rotation: f32,
+        /// 颜色调制（RGB）与不透明度（A）。
+        color: Rgba,
+        /// 加色混合（osu! 的 `P,,A`）。
+        additive: bool,
+    },
+    /// 外部纹理精灵：纹理内容由渲染后端从外部源（如浏览器视频帧）直接拷入，
+    /// 场景里只带槽位号——逐帧视频像素不进 CPU 内存。
+    ExternalSprite {
+        slot: u32,
         destination: SceneRect,
         alpha: f32,
     },
@@ -160,6 +197,16 @@ impl FrameSceneBuilder {
         }
     }
 
+    /// 画布宽度；绘制阶段需要据此把越界矩形夹回场景内。
+    pub fn width(&self) -> u32 {
+        self.size.width
+    }
+
+    /// 画布高度；与 [`Self::width`] 一起用于裁剪越界绘制。
+    pub fn height(&self) -> u32 {
+        self.size.height
+    }
+
     pub fn rectangle(&mut self, rect: SceneRect, color: Rgba) {
         self.commands.push(DrawCommand::Rectangle { rect, color });
     }
@@ -202,6 +249,29 @@ impl FrameSceneBuilder {
         let resource = self.insert_resource(image);
         self.commands.push(DrawCommand::Sprite {
             resource,
+            destination,
+            alpha,
+        });
+    }
+
+    /// 绘制带组合变换的贴图（旋转、缩放/翻转、颜色调制、加色混合）。
+    pub fn transformed_sprite(&mut self, image: Arc<Img>, spec: SpriteSpec) {
+        let resource = self.insert_resource(image);
+        self.commands.push(DrawCommand::TransformedSprite {
+            resource,
+            position: spec.position,
+            origin: spec.origin,
+            size: spec.size,
+            rotation: spec.rotation,
+            color: spec.color,
+            additive: spec.additive,
+        });
+    }
+
+    /// 绘制外部纹理槽位（如浏览器视频帧）；纹理由渲染后端按槽位号填充。
+    pub fn external_sprite(&mut self, slot: u32, destination: SceneRect, alpha: f32) {
+        self.commands.push(DrawCommand::ExternalSprite {
+            slot,
             destination,
             alpha,
         });
@@ -290,6 +360,33 @@ fn transform_command(
             alpha,
         } => DrawCommand::Sprite {
             resource: resources[resource],
+            destination: rect(*destination),
+            alpha: *alpha,
+        },
+        // 均匀缩放不改变旋转角与原点比例；尺寸按同样倍率缩放（负值=翻转保留符号）。
+        DrawCommand::TransformedSprite {
+            resource,
+            position,
+            origin,
+            size,
+            rotation,
+            color,
+            additive,
+        } => DrawCommand::TransformedSprite {
+            resource: resources[resource],
+            position: point(*position),
+            origin: *origin,
+            size: [size[0] * scale, size[1] * scale],
+            rotation: *rotation,
+            color: *color,
+            additive: *additive,
+        },
+        DrawCommand::ExternalSprite {
+            slot,
+            destination,
+            alpha,
+        } => DrawCommand::ExternalSprite {
+            slot: *slot,
             destination: rect(*destination),
             alpha: *alpha,
         },

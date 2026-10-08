@@ -1,28 +1,25 @@
-//! MP4（H.264）视频编码器：将回调生成的帧通过 H.264 和 `mp4` crate
-//! 流式写入 MP4 文件。流程类似 `save_animated_gif_streamed`：
-//! rayon 分块并行渲染，再顺序编码以保持帧顺序。
+//! MP4（H.264）视频编码器：将回调生成的帧通过 H.264 和 `mp4` crate 流式写入 MP4 文件。
+//! 流程类似 `save_animated_gif_streamed`：rayon 分块并行渲染，再顺序编码以保持帧顺序。
 //!
-//! 每帧物件层已经是最终视频画布（物件只会在视频边界被裁剪），画布底部叠上
-//! 暗化谱面背景；背景不可用或已关闭时使用黑色，并在右上角绘制“当前 / 总时长”标签。
-//! 随后转换为后端所需格式并编码为 H.264，再写入一个 MP4 sample。
-//! 完整动画不会同时驻留内存，最多保留 `PAR_CHUNK_SIZE` 个原始帧。
+//! 每帧物件层已经是最终视频画布（物件只在视频边界被裁剪），画布底部叠上暗化谱面
+//! 背景；背景不可用或已关闭时用黑色，并在右上角绘制“当前 / 总时长”标签。完整动画
+//! 不会同时驻留内存，最多保留 `PAR_CHUNK_SIZE` 个原始帧。
 //!
 //! ## GPU 加速
 //!
-//! 编码按顺序分派给第一个可用的后端：
-//!   1. **NVENC**（NVIDIA）：运行时动态加载 `nvEncodeAPI64.dll`。
-//!   2. **AMF**（AMD）：运行时动态加载 `amfrt64.dll`。
-//!   3. **openh264**（CPU）：始终可用的单线程软件编码回退（原始实现）。
-//!
-//! 所有后端都输出 Annex-B H.264 NAL，并交给共享封装层
-//!（`extract_nals` + `mp4` writer），因此输出文件结构一致。GPU DLL 通过
-//! `libloading` 加载；构建或运行时缺少 DLL 都不会影响程序，编码器会静默回退到 CPU。
+//! 编码按顺序分派给第一个可用的后端：1. **NVENC**（NVIDIA）、2. **AMF**（AMD），二者
+//! 运行时动态加载 DLL；3. **openh264**（CPU）始终可用作回退。所有后端都输出 Annex-B
+//! H.264 NAL 并交给共享封装层（`extract_nals` + `mp4` writer），输出文件结构一致；
+//! 构建或运行时缺少 DLL 都不影响程序，编码器静默回退到 CPU。
 
 use crate::cache::with_atomic_output_deadline;
 use crate::export::canvas::Img;
 use crate::export::text::{draw_text, text_size};
 use crate::media::audio::{encode_audio_segment, AudioSourceJob};
+use crate::media::background_video::{FrameBackgrounds, MediaBackground};
+use crate::media::storyboard::MediaStoryboard;
 use bytes::Bytes;
+use osu_beatmap_preview_core::hitsound::MusicRate;
 use osu_beatmap_preview_core::model::Beatmap;
 use osu_beatmap_preview_core::processing::parse::round_half_even;
 use osu_beatmap_preview_core::processing::timeline::{preview_start_ms, TimeAxis};
@@ -39,9 +36,8 @@ use std::time::Instant;
 
 /// 编码线程向渲染侧回传的耗时统计（纳秒）。
 ///
-/// 渲染与编码改成并行后，两侧的耗时无法再用同一条时间线相加，
-/// 因此改用原子累加：`render` 由渲染侧写入，`encode`/`mux` 由编码线程写入。
-/// 这些值只用于日志诊断，不影响画面与文件内容。
+/// 渲染与编码在两条时间线上，耗时无法用同一条时间线相加，因此按线程原子累加：
+/// `render` 由渲染侧写入，`encode`/`mux` 由编码线程写入。只用于日志诊断。
 #[derive(Default)]
 pub(super) struct PipelineStages {
     render_ns: AtomicU64,
@@ -61,15 +57,21 @@ impl PipelineStages {
 
 /// 渲染线程池与封装循环之间的在途帧上限。
 ///
-/// 上限按 `PAR_CHUNK_SIZE` 收敛，使「在途帧数 × 帧字节」与改造前
-/// 单批渲染的内存占用同量级（默认 8 帧），不会因为流水线把峰值内存放大。
+/// 上限按 `PAR_CHUNK_SIZE` 收敛（默认 8 帧），使「在途帧数 × 帧字节」保持个位数
+/// MB 量级，不会因为流水线把峰值内存放大。
 fn encoder_queue_capacity(par_chunk_size: usize) -> usize {
     par_chunk_size.clamp(1, 8)
 }
 
-#[derive(Debug, Clone, Copy)]
+/// 后端无关的视频合成样式。
+///
+/// `Default` 只用于背景视频解码上下文的「尚未配置」占位（`background_video.rs`
+/// 在 `begin_decode` 前构造），实际渲染一律用 [`video_style`] 从配置取。
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VideoStyle {
     pub(crate) enable_background_image: bool,
+    pub(crate) enable_background_video: bool,
+    pub(crate) enable_storyboard: bool,
     pub(crate) background_dim: f64,
     pub(crate) label_color: [u8; 4],
     pub(crate) label_font_size: u32,
@@ -96,6 +98,8 @@ pub(crate) fn video_style(mode: crate::export::geometry::GameMode) -> VideoStyle
             let section = $section;
             VideoStyle {
                 enable_background_image: section.style.ENABLE_BACKGROUND_IMAGE,
+                enable_background_video: section.style.ENABLE_BACKGROUND_VIDEO,
+                enable_storyboard: section.style.ENABLE_STORYBOARD,
                 background_dim: section.style.BACKGROUND_DIM,
                 label_color: section.style.LABEL_COLOR,
                 label_font_size: section.sizing.LABEL_FONT_SIZE,
@@ -222,6 +226,14 @@ pub(crate) fn resolve_video_time_range(
     })
 }
 
+/// 输出帧号对应的谱面绝对时间（毫秒）。
+///
+/// 四模式的 `render` 回调与背景视频取帧共用这一个公式（banker's 舍入，与
+/// 模式侧的 `pyround` / `rhe` 同一实现），保证玩法层与背景视频帧严格对齐。
+pub(crate) fn frame_time_ms(chart_start_ms: i64, frame_index: usize, speed: f64, fps: u32) -> i64 {
+    chart_start_ms + round_half_even(frame_index as f64 * 1000.0 * speed / fps as f64)
+}
+
 fn validate_video_time_range(range: VideoTimeRange) -> Result<VideoTimeRange> {
     let duration = range
         .end
@@ -282,18 +294,23 @@ pub(super) trait FrameEncoder: Send {
 /// `time_axis` 转换，因此总时长独立于所选导出范围及首尾留白。
 /// 帧分块并行渲染并顺序编码以保持顺序；`fps` 同时作为编码帧率与 MP4 时间尺度
 ///（每帧一个 tick）。
+/// 背景按 [`frame_time_ms`] 的时间轴逐帧合成：静态背景图垫底，背景视频叠在
+/// 上面（含 osu! 式淡入淡出）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn save_mp4_streamed(
     frame_count: usize,
     chart_start_ms: i64,
     last_object_ms: i64,
     speed: f64,
+    music: MusicRate,
+    nightcore: bool,
     render: impl Fn(usize) -> Result<(Img, i64)> + Send + Sync,
     output_path: &Path,
     fps: u32,
     audio_job: AudioSourceJob,
     beatmap: Beatmap,
-    background: Option<Img>,
+    background: MediaBackground,
+    storyboard: Option<MediaStoryboard>,
     time_axis: TimeAxis,
     deadline: &RequestDeadline,
     mode: crate::export::geometry::GameMode,
@@ -316,7 +333,7 @@ pub(crate) fn save_mp4_streamed(
     }
 
     let audio_deadline = deadline.clone();
-    let hitsound = hitsound_settings(mode);
+    let hitsound = hitsound_settings(mode).with_nightcore(nightcore);
     let mut audio_task = JoinedAudioTask::new(
         std::thread::spawn(move || {
             audio_deadline.check()?;
@@ -329,6 +346,7 @@ pub(crate) fn save_mp4_streamed(
                 frame_count,
                 fps,
                 speed,
+                music,
                 &audio_deadline,
             )?;
             crate::logging::event(
@@ -361,12 +379,15 @@ pub(crate) fn save_mp4_streamed(
     // 这里绝不能再对已合成的帧调用 `video_canvas_16_9`（它不幂等，会撑大分辨率）。
     let (out_w, out_h) = (pf_w, pf_h);
     let style = video_style(mode);
-    let background = match composition {
-        FrameComposition::Canvas => background
-            .as_ref()
-            .map(|image| prepare_video_background(image, out_w, out_h, style)),
-        FrameComposition::FinalRgba => None,
-    };
+    // 输出时间轴（谱面绝对毫秒）：背景视频按它做「只保留会被取样到的画面」
+    // 的并行解码，逐帧预取也用同一份时间，保证背景与玩法帧严格对齐。
+    let chart_times: Vec<i64> = (0..frame_count)
+        .map(|frame_index| frame_time_ms(chart_start_ms, frame_index, speed, fps))
+        .collect();
+    // 背景（静态图 + 背景视频）只在最终画布上处理一次，避免 playfield 与画布
+    // 分别裁剪同一素材造成画面不连续；`FinalRgba` 回调已自行合成最终帧，
+    // 不会调用 `background_at`，因此这里无需区分对待。
+    let mut backgrounds = FrameBackgrounds::new(background, out_w, out_h, style, &chart_times);
 
     // ── 选择最佳可用编码后端 ──
     let mut encoder = create_encoder(out_w, out_h, fps)?;
@@ -393,15 +414,20 @@ pub(crate) fn save_mp4_streamed(
         .clamp(1, crate::config::current().advance.video.PAR_CHUNK_SIZE);
 
     // ── 编码首帧并提取 SPS/PPS，供 MP4 轨道配置使用 ──
+    let first_background = (composition == FrameComposition::Canvas)
+        .then(|| backgrounds.background_at(chart_times[0]))
+        .flatten();
     let first_comp = match composition {
         FrameComposition::Canvas => compose_frame(
             first_frame,
             time_axis.to_display(first_time),
+            first_time,
             time_axis.to_display(last_object_ms),
             out_w,
             out_h,
-            background.as_ref(),
+            first_background.as_deref(),
             style,
+            storyboard.as_ref(),
         ),
         FrameComposition::FinalRgba => first_frame,
     };
@@ -487,10 +513,8 @@ pub(crate) fn save_mp4_streamed(
             .map_err(|e| PreviewError::render(format!("mp4 write_sample failed: {e}")))?;
 
         // ── 流水线：渲染线程池持续预渲染，独立线程顺序编码并封装 ──
-        // 编码必须严格按帧号顺序执行（H.264 参考帧 + MP4 sample 顺序），
-        // 所以这里只把「编码」留在单线程上，让「渲染 + 合成」与它重叠进行。
-        // 改造前是「整块渲染 → 整块顺序编码」，rayon 在编码阶段完全空闲；
-        // 现在渲染侧只受有界通道背压，编码线程始终有下一帧可取。
+        // 编码必须严格按帧号顺序（H.264 参考帧 + MP4 sample 顺序），所以只把「编码」
+        // 留在单线程上，让「渲染 + 合成」与它重叠进行，渲染侧只受有界通道背压。
         //
         // 后端名字必须先取成 `&'static str`：`name()` 是 `&self` 方法，
         // 而编码器本身要被移进编码线程。
@@ -523,6 +547,22 @@ pub(crate) fn save_mp4_streamed(
                 break;
             }
             let chunk_end = (chunk_start + par_chunk_size).min(frame_count);
+            // 每块先按时间轴预取好各帧背景（视频画面由分段并行解码按时间序
+            // 供给），再并行合成；首个导出区间可能要一次解过很长一段视频，
+            // 逐帧检查超时并干净退出。
+            let mut chunk_backgrounds: Vec<Option<Arc<Img>>> =
+                Vec::with_capacity(chunk_end - chunk_start);
+            if composition == FrameComposition::Canvas {
+                for &time in &chart_times[chunk_start..chunk_end] {
+                    if let Err(error) = deadline.check() {
+                        send_failure = Some(Err(error));
+                        break 'pipeline;
+                    }
+                    chunk_backgrounds.push(backgrounds.background_at(time));
+                }
+            } else {
+                chunk_backgrounds.resize(chunk_end - chunk_start, None);
+            }
             let t0 = Instant::now();
             let rendered: Result<Vec<Img>> = (chunk_start..chunk_end)
                 .into_par_iter()
@@ -540,11 +580,13 @@ pub(crate) fn save_mp4_streamed(
                         FrameComposition::Canvas => compose_frame(
                             pf,
                             time_axis.to_display(time),
+                            time,
                             gameplay_total,
                             out_w,
                             out_h,
-                            background.as_ref(),
+                            chunk_backgrounds[fi - chunk_start].as_deref(),
                             style,
+                            storyboard.as_ref(),
                         ),
                         FrameComposition::FinalRgba => pf,
                     })
@@ -650,9 +692,8 @@ pub(crate) fn save_mp4_streamed(
         Ok(encoder)
     })?;
 
-    // 返回前显式释放编码器。`nvenc` crate 的 Drop 实现使用 `println!` 向 stdout
-    // 输出调试信息，会污染 JSON 输出。临时将 stdout 切换到 stderr，使调试信息
-    // 写入 stderr，从而保持 JSON 输出纯净。
+    // 返回前显式释放编码器：`nvenc` crate 的 Drop 用 `println!` 写 stdout，会污染
+    // JSON 输出；临时把 stdout 切到 stderr 吞掉这些调试信息，返回前恢复。
     drop_stdout_silence(|| {
         drop(encoder);
     });
@@ -869,36 +910,60 @@ fn prepare_video_background_inner(
     };
     let resized_width = ((source.w as f64 * scale).round() as u32).max(1);
     let resized_height = ((source.h as f64 * scale).round() as u32).max(1);
-    let resized = source.resize(resized_width, resized_height);
+    // 双线性而非 Lanczos3：这条路径逐帧执行（视频背景每秒换几十次），
+    // Lanczos 每帧要 32ms，是背景视频合成的七成耗时；暗化装饰层看不出差别。
+    let resized = source.resize_bilinear(resized_width, resized_height);
     let left = (width as i64 - resized_width as i64) / 2;
     let top = (height as i64 - resized_height as i64) / 2;
     result.alpha_composite(&resized, left, top);
+    // 暗化用整数查找表：逐像素 f64 循环在逐帧路径上同样不划算。
     let brightness = 1.0 - style.background_dim.clamp(0.0, 1.0);
+    let table: [u8; 256] = std::array::from_fn(|value| (value as f64 * brightness).round() as u8);
     for pixel in result.data.chunks_exact_mut(4) {
-        pixel[0] = (pixel[0] as f64 * brightness).round() as u8;
-        pixel[1] = (pixel[1] as f64 * brightness).round() as u8;
-        pixel[2] = (pixel[2] as f64 * brightness).round() as u8;
+        pixel[0] = table[pixel[0] as usize];
+        pixel[1] = table[pixel[1] as usize];
+        pixel[2] = table[pixel[2] as usize];
     }
     result
 }
 
 /// 将游戏区域帧居中放置到 16:9 背景画布，并在右上角绘制
 ///“当前 / 总时长”游戏时间标签；没有谱面背景时画布为黑色。
+///
+/// 故事板（启用时）层序与 osu! 一致：underlay（Background/Pass/Foreground）压在
+/// 背景之上、物件层之下，只有 Overlay 层压在物件层之上、时间标签之下；全部层都
+/// 与背景同吃 `BACKGROUND_DIM` 暗度（亮度预乘进精灵颜色）。`chart_ms` 是谱面
+/// 绝对毫秒，`current_ms` 是进度标签用的显示时间。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compose_frame(
     pf: Img,
     current_ms: i64,
+    chart_ms: i64,
     total_ms: i64,
     out_w: u32,
     out_h: u32,
     background: Option<&Img>,
     style: VideoStyle,
+    storyboard: Option<&MediaStoryboard>,
 ) -> Img {
     let mut canvas = background
         .cloned()
         .unwrap_or_else(|| Img::new(out_w, out_h, style.black_opaque));
+    // 与背景图同一亮度：背景已按 (1 - BACKGROUND_DIM) 预暗化，故事板同倍率
+    // 乘进精灵颜色后，与「整层压暗」的合成结果逐像素一致。
+    let brightness = (1.0 - style.background_dim.clamp(0.0, 1.0)) as f32;
+    // 故事板每帧只求值一次，两半分别画在物件层两侧：分两次求值会让另一半的
+    // 状态结果直接丢弃（元素多的谱面上每帧白算一半的精灵状态）。
+    let storyboard_draws = storyboard.map(|storyboard| storyboard.sprites_at(chart_ms));
+    if let Some((storyboard, draws)) = storyboard.zip(storyboard_draws.as_ref()) {
+        storyboard.draw_sprites(&mut canvas, &draws.0, brightness);
+    }
     let ox = ((out_w - pf.w) / 2) as i64;
     let oy = ((out_h - pf.h) / 2) as i64;
     canvas.alpha_composite(&pf, ox, oy);
+    if let Some((storyboard, draws)) = storyboard.zip(storyboard_draws.as_ref()) {
+        storyboard.draw_sprites(&mut canvas, &draws.1, brightness);
+    }
 
     let label = format_progress_label(current_ms, total_ms);
     let (lw, _) = text_size(&label, style.label_font_size);

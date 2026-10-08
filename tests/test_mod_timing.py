@@ -68,7 +68,17 @@ with Image.open(result['preview-img']) as image:
 """
 
 
-@pytest.mark.parametrize("mode,mods", [(0, "hd+hr+dt"), (1, "sw+hr+cs+dt"), (3, "in+cs+ht")])
+@pytest.mark.parametrize(
+    "mode,mods",
+    [
+        (0, "hd+hr+dt"),
+        (1, "sw+hr+cs+dt"),
+        (3, "in+cs+ht"),
+        (0, "at+nc"),
+        (1, "hd+dc"),
+        (3, "fl+nc"),
+    ],
+)
 @pytest.mark.parametrize("fps", [15, 30, 60])
 def test_mod_combinations_preserve_gif_playback_duration(
     tmp_path: Path, mode: int, mods: str, fps: int

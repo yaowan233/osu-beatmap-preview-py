@@ -11,8 +11,8 @@ use crate::render::canvas::Img;
 use crate::render::cpu::modes::standard::alpha::*;
 use crate::render::cpu::modes::standard::constants::*;
 use crate::render::cpu::modes::standard::context::{
-    apply_standard_object_mods, build_render_context, build_visible_indexes_by_snapshot, py_round,
-    stacked_position, standard_objects, to_frame_point, RenderCache, RenderContext,
+    apply_standard_object_mods, build_video_render_context, build_visible_indexes_by_snapshot,
+    py_round, stacked_position, standard_objects, to_frame_point, RenderCache, RenderContext,
 };
 use crate::render::cpu::modes::standard::follow_points::{
     build_sprite, follow_point_height, follow_point_position, follow_point_state,
@@ -36,7 +36,6 @@ struct PreparedSlider {
 struct PreparedBreak {
     period: BreakPeriod,
     counters: Vec<Arc<Img>>,
-    info: Arc<Img>,
 }
 
 /// 预旋转好的跟随点图标：按连接方向的角度取整后共享，逐帧只做缩放与合成。
@@ -55,7 +54,12 @@ pub fn prepare_realtime(
     time_axis: TimeAxis,
 ) -> Result<RealtimeFrameSource> {
     let objects = apply_standard_object_mods(standard_objects(beatmap)?, mods);
-    let context = build_render_context(beatmap, objects, mods, time_axis, OutputFormat::Mp4);
+    // 与 MP4 导出用同一套画布布局：物件层就是 16:9 画布本身。
+    // 内容框布局下 FL 遮罩只盖住 playfield，合成阶段补出的背景不会被压暗。
+    let context = build_video_render_context(beatmap, objects, mods, time_axis, OutputFormat::Mp4);
+    if let Some(autoplay) = &context.autoplay {
+        autoplay.get(&context);
+    }
     if let Some(flashlight) = &context.flashlight {
         flashlight.get(&context);
     }
@@ -210,6 +214,33 @@ fn render_scene(
     {
         draw_break(&mut scene, context, current, time);
     }
+    if let Some(cache) = &context.autoplay {
+        let cursor = cache.get(context);
+        cursor.visit_trail(
+            time,
+            context.frame_layout.scale,
+            |from, to, width, alpha| {
+                scene.line(
+                    [from[0] as f32, from[1] as f32],
+                    [to[0] as f32, to[1] as f32],
+                    width as f32,
+                    [255, 255, 255, alpha],
+                );
+            },
+        );
+        if let (Some(position), Some(sprite)) = (cursor.position_at(time), cursor.sprite_at(time)) {
+            scene.sprite(
+                Arc::clone(sprite),
+                rect(
+                    position[0] - sprite.w as f64 / 2.0,
+                    position[1] - sprite.h as f64 / 2.0,
+                    sprite.w as f64,
+                    sprite.h as f64,
+                ),
+                1.0,
+            );
+        }
+    }
     scene.finish()
 }
 
@@ -284,11 +315,7 @@ fn draw_slider(
     let path = if snake_start <= 0.001 && snake_end >= 0.999 {
         Arc::clone(&slider.full_path)
     } else {
-        path_vertices(&crate::domain::shared::slider_path::slice_path(
-            &slider.data.frame_path,
-            snake_start,
-            snake_end,
-        ))
+        path_vertices(&slider.data.body_path(snake_start, snake_end))
     };
     if path.len() >= 2 && body_alpha > 0.0 {
         let alpha = alpha_to_byte(body_alpha);
@@ -441,7 +468,8 @@ fn draw_slider_ball(
     let completion =
         (time - object.start_time) as f64 / (object.end_time - object.start_time).max(1) as f64;
     let progress = slider_path_progress(object.slider_repeats.max(1) as i64, completion);
-    let center = crate::domain::shared::slider_path::path_position_at(&slider.frame_path, progress);
+    let center =
+        crate::domain::shared::slider_path::path_position_at(&slider.timing_path, progress);
     let point = [center.0 as f32, center.1 as f32];
     let follow_radius = context.slider_follow_size as f32 / 2.0;
     let follow_border = (4.0 * context.frame_circle_diameter as f64 / 128.0).max(1.0) as f32;
@@ -476,7 +504,7 @@ fn draw_slider_ball(
     // 方向箭头：与 CPU 路径共用几何参数，用两段线段加三个圆头拼出 `>` 形
     // （`Line` 命令没有旋转，圆头也要显式补上），朝向由共享的旋转函数解析计算。
     if let Some(angle) = slider_ball_arrow_angle(
-        &slider.frame_path,
+        &slider.timing_path,
         object.slider_repeats.max(1) as i64,
         completion,
     ) {
@@ -504,43 +532,7 @@ fn draw_spinner(
     object: &StandardHitObject,
     time: i64,
 ) {
-    let alpha = spinner_alpha(object, time, &context.settings);
-    if alpha <= 0.0 {
-        return;
-    }
-    let center = to_frame_point(
-        PLAYFIELD_WIDTH / 2.0,
-        PLAYFIELD_HEIGHT / 2.0,
-        &context.frame_layout,
-    );
-    let point = [center.0 as f32, center.1 as f32];
-    let scale = context.spinner_size as f64 / 256.0;
-    let base = 80.0 * scale;
-    let progress = ((time - object.start_time) as f64
-        / (object.end_time - object.start_time).max(1) as f64)
-        .clamp(0.0, 1.0);
-    scene.circle(
-        point,
-        (base * (0.8 + 0.6 * progress)) as f32,
-        [
-            ARGON_SPINNER_PINK[0],
-            ARGON_SPINNER_PINK[1],
-            ARGON_SPINNER_PINK[2],
-            (30.0 * alpha) as u8,
-        ],
-    );
-    scene.ring(
-        point,
-        (base * 0.8) as f32,
-        (10.0 * scale).max(1.0) as f32,
-        [255, 255, 255, alpha_to_byte(alpha)],
-    );
-    scene.ring(
-        point,
-        base as f32,
-        (3.0 * scale).max(1.0) as f32,
-        [255, 255, 255, alpha_to_byte(alpha)],
-    );
+    crate::render::cpu::modes::standard::spinner::draw_gpu(scene, context, object, time);
 }
 
 fn draw_approach_circle(
@@ -658,7 +650,6 @@ fn draw_number(
 fn prepare_breaks(periods: &[BreakPeriod], context: &RenderContext) -> Vec<PreparedBreak> {
     let scale = crate::render::geometry::output_scale(GameMode::Standard, context.output_format);
     let counter_size = scaled_bitmap_font_height(BREAK_OVERLAY_COUNTER_FONT_SIZE, scale);
-    let info_size = scaled_bitmap_font_height(BREAK_OVERLAY_INFO_FONT_SIZE, scale);
     periods
         .iter()
         .map(|period| {
@@ -672,17 +663,9 @@ fn prepare_breaks(periods: &[BreakPeriod], context: &RenderContext) -> Vec<Prepa
                     ))
                 })
                 .collect();
-            let label = format!(
-                "Break {} - {}",
-                crate::render::text::format_mmssmmm(
-                    context.time_axis.to_display(period.start_time)
-                ),
-                crate::render::text::format_mmssmmm(context.time_axis.to_display(period.end_time)),
-            );
             PreparedBreak {
                 period: *period,
                 counters,
-                info: Arc::new(render_text_sprite(&label, info_size, [255, 255, 255, 255])),
             }
         })
         .collect()
@@ -754,18 +737,6 @@ fn draw_break(
             [238, 238, 238, alpha_to_byte(alpha)],
         );
     }
-    scene.glyph(
-        Arc::clone(&prepared.info),
-        rect(
-            (width - prepared.info.w as f64) / 2.0,
-            center_y
-                + crate::render::geometry::scale_px(BREAK_OVERLAY_INFO_TOP_GAP as f64, scale)
-                    as f64,
-            prepared.info.w as f64,
-            prepared.info.h as f64,
-        ),
-        [185, 185, 185, alpha_to_byte(alpha)],
-    );
 }
 
 fn break_alpha(period: &BreakPeriod, time: i64) -> f64 {
@@ -868,6 +839,7 @@ mod tests {
             }]),
             break_periods: Vec::new(),
             background_filename: None,
+            video: None,
             combo_colors: Vec::new(),
             beat_divisor: 0,
         }
@@ -916,6 +888,7 @@ mod tests {
             hit_objects: HitObjects::Standard(vec![circle(100, 1000), circle(400, 2000)]),
             break_periods: Vec::new(),
             background_filename: None,
+            video: None,
             combo_colors: Vec::new(),
             beat_divisor: 0,
         }
@@ -944,8 +917,11 @@ mod tests {
         let visible = sprites(&scene);
         // 距离 300 共 7 个跟随点（48 起每 32 一个），各自的存活区间都覆盖 1200ms。
         assert_eq!(visible.len(), 7);
-        let layout =
-            crate::render::cpu::modes::standard::context::build_frame_layout(OutputFormat::Mp4);
+        // 实时物件层与 MP4 导出一样画在 16:9 画布上（内容框居中），
+        // 因此期望坐标也用 video 布局换算。
+        let layout = crate::render::cpu::modes::standard::context::build_video_frame_layout(
+            OutputFormat::Mp4,
+        );
         let center = to_frame_point(148.0, 192.0, &layout);
         assert!(
             visible.iter().any(|quad| {

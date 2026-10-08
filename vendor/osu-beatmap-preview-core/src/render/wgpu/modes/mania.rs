@@ -8,8 +8,8 @@ use crate::domain::mods::ModSettings;
 use crate::domain::parser::round_half_even;
 use crate::render::canvas::{Img, Rgba};
 use crate::render::cpu::modes::mania::animation::{
-    build_layout, build_scroll_map, compute_time_range, draw_gif_hit_object, mania_flashlight,
-    mania_hidden, mania_visibility_timeline, segment_left, visible_pos_window,
+    build_scroll_map, build_video_layout, compute_time_range, draw_gif_hit_object,
+    mania_flashlight, mania_hidden, mania_visibility_timeline, segment_left, visible_pos_window,
 };
 use crate::render::cpu::modes::mania::skin::load_mania_skin_config;
 use crate::render::cpu::modes::mania::{
@@ -45,7 +45,9 @@ pub fn prepare_realtime(
         .then(|| mania_visibility_timeline(&hit_objects, &beatmap.break_periods));
     let speed = mods.map_or(1.0, |value| value.speed_multiplier);
     let skin_config = load_mania_skin_config(key_count, OutputFormat::Mp4);
-    let layout = build_layout(&skin_config, 1, false, OutputFormat::Mp4);
+    // 与 MP4 导出用同一套画布布局：物件层就是 16:9 画布本身，
+    // 否则 FL 遮罩只盖住舞台区域，合成阶段补出的背景不会被压暗。
+    let layout = build_video_layout(&skin_config, OutputFormat::Mp4);
     let native_mania = is_native_mania(beatmap);
     let cs_mode = mods.is_some_and(|value| value.cs_override);
     let scroll_map = build_scroll_map(beatmap, &original_objects, cs_mode, native_mania);
@@ -179,6 +181,10 @@ pub fn prepare_realtime(
                     );
                 }
                 if flashlight {
+                    // FL 是整帧遮罩：lazer 的 `ModFlashlight` 把遮罩加到
+                    // `drawableRuleset.Overlays`，压在键道底色、判定线和音符之上；
+                    // GIF/MP4 导出同样画在合成好的背景上。这里不能只压暗音符层，
+                    // 否则实时预览会与 lazer 以及两条导出链路不一致。
                     mania_flashlight(timeline, absolute_time_ms, &layout, left).draw_scene(
                         &mut scene,
                         crate::render::geometry::PixelRect {

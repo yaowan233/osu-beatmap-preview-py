@@ -120,6 +120,8 @@ pub struct RenderStandardMp4StyleConfig {
     pub ENABLE_BEATMAP_HITSOUND: bool,
     pub HITSOUND_VOLUME: i64,
     pub ENABLE_BACKGROUND_IMAGE: bool,
+    pub ENABLE_BACKGROUND_VIDEO: bool,
+    pub ENABLE_STORYBOARD: bool,
     pub BACKGROUND_DIM: f64,
     pub LABEL_COLOR: [u8; 4],
     pub BLACK_OPAQUE: [u8; 4],
@@ -274,6 +276,8 @@ pub struct RenderTaikoMp4SizingConfig {
 #[allow(dead_code, non_snake_case, non_camel_case_types)]
 pub struct RenderTaikoMp4StyleConfig {
     pub ENABLE_BACKGROUND_IMAGE: bool,
+    pub ENABLE_BACKGROUND_VIDEO: bool,
+    pub ENABLE_STORYBOARD: bool,
     pub BACKGROUND_DIM: f64,
     pub LABEL_COLOR: [u8; 4],
     pub BLACK_OPAQUE: [u8; 4],
@@ -430,6 +434,8 @@ pub struct RenderCatchMp4SizingConfig {
 #[allow(dead_code, non_snake_case, non_camel_case_types)]
 pub struct RenderCatchMp4StyleConfig {
     pub ENABLE_BACKGROUND_IMAGE: bool,
+    pub ENABLE_BACKGROUND_VIDEO: bool,
+    pub ENABLE_STORYBOARD: bool,
     pub BACKGROUND_DIM: f64,
     pub LABEL_COLOR: [u8; 4],
     pub BLACK_OPAQUE: [u8; 4],
@@ -597,6 +603,8 @@ pub struct RenderManiaMp4SizingConfig {
 #[allow(dead_code, non_snake_case, non_camel_case_types)]
 pub struct RenderManiaMp4StyleConfig {
     pub ENABLE_BACKGROUND_IMAGE: bool,
+    pub ENABLE_BACKGROUND_VIDEO: bool,
+    pub ENABLE_STORYBOARD: bool,
     pub BACKGROUND_DIM: f64,
     pub LABEL_COLOR: [u8; 4],
     pub BLACK_OPAQUE: [u8; 4],

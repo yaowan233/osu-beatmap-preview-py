@@ -6,9 +6,11 @@ the MIT License:
 
 > Copyright (c) 2026 xuan_yuan
 
-The core and CLI crates are vendored from commit `73b4b9c0ce4d125e614eb38f106e2d0d80a9cb0c`
-with CTB Hidden rendering, corrected default hyperdash outline colours, and
-self-contained build assets. Each crate includes its complete MIT license and
+The core and CLI crates are vendored from upstream main commit
+[`0045d40cdf5a0a6b5cfb7da502668b845fcd3024`](https://github.com/2710165659/osu-beatmap-preview/commit/0045d40cdf5a0a6b5cfb7da502668b845fcd3024)
+(after v1.4.0), with self-contained build assets and compatibility annotations
+for the pinned Rust toolchain. The former rendering patches are included upstream.
+Each crate includes its complete MIT license and
 an `UPSTREAM.toml` provenance record in its respective `vendor/` directory.
 
 Hidden fade timing follows the MIT-licensed osu!catch implementation:

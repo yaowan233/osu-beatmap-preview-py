@@ -4,9 +4,10 @@
 Python 原生扩展。渲染器通过 PyO3 直接运行在 Python 进程内，不需要下载、配置或启动额外的
 可执行文件。
 
-> 当前为早期开发版本。Rust 渲染器使用固定提交的上游 v1.3.3，core 与 CLI 随仓库分发，
-> 包含 CTB Hidden、默认红果配色、standard 跨请求缓存、taiko DT/HT 滚动和 GIF 时长补丁，
-> 以确保 Python wheel 在各平台使用相同的渲染行为。
+> 当前为早期开发版本。0.1.9 使用上游 main 的固定提交
+> [`0045d40`](https://github.com/2710165659/osu-beatmap-preview/commit/0045d40cdf5a0a6b5cfb7da502668b845fcd3024)
+>（v1.4.0 之后），core、CLI 和构建资源随仓库分发，确保各平台 wheel 使用相同的渲染行为。
+> 本次更新包含 NC/DC、Standard AT、故事板与背景视频，以及 Aspire 谱面的音频混合和音画同步修复。
 
 ## 安装
 
@@ -66,14 +67,21 @@ result = await generate_preview_async(
 
 | 模式 | 支持的模组 |
 | --- | --- |
-| Standard | `EZ`、`HR`、`HD`、`FL`、`TC`、`DA`、`DT`、`HT` |
-| Taiko | `EZ`、`HR`、`HD`、`FL`、`SW`、`CS`、`DT`、`HT` |
-| Catch | `EZ`、`HR`、`HD`、`FL`、`DT`、`HT` |
-| Mania | `HD`、`FL`、`1K`–`10K`、`DS`、`IN`、`HO`、`CS`、`DT`、`HT` |
+| Standard | `EZ`、`HR`、`HD`、`FL`、`AT`、`TC`、`DA`、`DT`、`HT`、`NC`、`DC` |
+| Taiko | `EZ`、`HR`、`HD`、`FL`、`SW`、`CS`、`DT`、`HT`、`NC`、`DC` |
+| Catch | `EZ`、`HR`、`HD`、`FL`、`DT`、`HT`、`NC`、`DC` |
+| Mania | `HD`、`FL`、`1K`–`10K`、`DS`、`IN`、`HO`、`CS`、`DT`、`HT`、`NC`、`DC` |
 
 组合中的每个模组都必须受当前模式支持；Mania 的 `HD+FL` 互斥，其余三种模式可组合使用。
 `HD+TC`、`IN+HO`、`EZ+HR`、`DT+HT` 互斥；mania 的键数模组和 DS 只影响 standard 转谱。
 GIF 和 MP4 使用相同的模组支持规则，GIF 在 15、30、60 fps 下也会保持请求的播放时长。
+
+`DT`/`HT` 的 MP4 音乐保调变速，可用 `dt1.25`、`ht0.9` 指定倍速；`NC`/`DC` 默认以
+1.5x / 0.75x 播放，也可指定倍速，音乐音高倍率固定为 1.5 / 0.75，`NC` 还叠加节拍鼓点。
+速度模组不能混用。
+Standard 的 `AT` 显示自动游玩光标。四模式 MP4 可通过
+`render.<mode>.mp4.style.ENABLE_STORYBOARD` 和 `ENABLE_BACKGROUND_VIDEO` 启用故事板及背景视频，
+两项默认关闭；`<mode>` 为 `standard`、`taiko`、`catch` 或 `mania`。
 
 Taiko HD 隐藏普通音符和连打刻度，保留连打条与气球；Mania HD 让音符头、长按主体
 在判定线附近渐隐，遮罩随连击扩大。HD 不会遮住 Mania 判定线、键道背景或 SV 提示。

@@ -1,27 +1,23 @@
 //! 打击音混音器：把时间轴上的事件混合成 PCM。
 
-use super::{HitsoundTimeline, PlayFrequency, SampleLibrary};
+use super::music::{MusicPlayer, MusicRate};
+use super::{HitsoundTimeline, PlayFrequency, SampleData, SampleLibrary};
 
 /// 正在播放的一个声音。
+///
+/// `end_ms` 是发声区间终点（无限 = 按样本长度播或直到显式停止）；`data_end_ms` 是
+/// 样本数据播完的时刻（循环音为无限）。回收取两者较小值：时长 0 的事件 `end_ms`
+/// 是无限，只看它会让声音列表无限增长，长谱面混音会掉到实时以下。
 #[derive(Debug, Clone, Copy)]
 struct Voice {
-    /// 声音句柄：显式触发（游玩/回放）时由调用方持有，用于停止循环音。
     id: u64,
     source_id: usize,
     gain: f64,
-    /// 事件在时间轴上的起始毫秒。
     start_ms: f64,
-    /// 事件结束毫秒；无限表示按样本自身长度播放。
     end_ms: f64,
-    /// 样本数据播完的毫秒时刻（循环音为无限，因为它会一直绕回开头）。
-    ///
-    /// 非循环音的 `end_ms` 是无限（时长 0 表示只播一次样本），只用 `end_ms` 判断
-    /// 是否回收会让声音列表随播放不断增长——每个输出帧都要遍历整张列表，长谱面会
-    /// 把混音拖到实时以下（Web 端表现为打击音整体消失）。
     data_end_ms: f64,
-    /// 循环音在样本内的循环长度（采样帧）；0 表示不循环。
+    /// 循环长度（采样帧）；0 表示不循环。
     loop_len: usize,
-    /// 播放频率（音高倍率）随时间的斜坡；转盘旋转音靠它随进度升调。
     frequency: PlayFrequency,
 }
 
@@ -29,35 +25,43 @@ struct Voice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoopHandle(u64);
 
-/// 基于时间轴与样本库的离线混音器。
+/// 基于时间轴与样本库的混音器：位置单位是谱面毫秒（与渲染共用同一条时间轴），
+/// 输出固定采样率的交错立体声 f32。
 ///
-/// 混音位置以「谱面毫秒」为单位，与渲染共用同一条时间轴；输出为固定采样率的
-/// 立体声交错 f32，宿主只需把结果送到音频接口或编码器。
-///
-/// 声音有两个来源：时间轴事件（预览/导出）与显式触发（游玩、回放由输入驱动）。
-/// 两者写进同一张声音列表，因此增益、限幅与回收逻辑只有一份。
+/// 声音来自时间轴事件与显式触发（游玩/回放）；背景音乐是第三个声部，不在声音
+/// 列表里、按位置逐帧采样叠加，倍速、seek、暂停共用同一处位置计算。
 #[derive(Debug, Clone)]
 pub struct HitsoundMixer {
     library: SampleLibrary,
     timeline: HitsoundTimeline,
     sample_rate: u32,
     master_gain: f64,
-    /// 当前混音位置（谱面毫秒）。
+    /// 背景音乐：谱面时间 0 对应音乐第 0 帧，整段只播一次、不循环。
+    music: Option<SampleData>,
+    music_rate: MusicRate,
+    music_player: MusicPlayer,
+    /// 音乐窗口缓冲（交错立体声）：时间伸缩有状态，必须整窗口渲染后逐帧相加。
+    music_scratch: Vec<f32>,
+    music_gain: f64,
     position_ms: f64,
     voices: Vec<Voice>,
-    /// 下一个尚未开始的事件索引。
     next_event: usize,
-    /// 声音句柄计数。
     next_voice_id: u64,
 }
 
 impl HitsoundMixer {
     pub fn new(library: SampleLibrary, timeline: HitsoundTimeline, sample_rate: u32) -> Self {
+        let sample_rate = sample_rate.max(1);
         Self {
             library,
             timeline,
-            sample_rate: sample_rate.max(1),
+            sample_rate,
             master_gain: 1.0,
+            music: None,
+            music_rate: MusicRate::IDENTITY,
+            music_player: MusicPlayer::new(sample_rate),
+            music_scratch: Vec::new(),
+            music_gain: 1.0,
             position_ms: 0.0,
             voices: Vec::new(),
             next_event: 0,
@@ -75,11 +79,35 @@ impl HitsoundMixer {
 
     /// 设置主音量（线性增益）。非有限值按静音处理。
     pub fn set_master_gain(&mut self, gain: f64) {
-        self.master_gain = if gain.is_finite() {
-            gain.clamp(0.0, 8.0)
-        } else {
-            0.0
-        };
+        self.master_gain = sanitize_gain(gain);
+    }
+
+    /// 设置背景音乐。
+    pub fn set_music(&mut self, music: Option<SampleData>) {
+        self.music = music;
+    }
+
+    pub fn music(&self) -> Option<&SampleData> {
+        self.music.as_ref()
+    }
+
+    /// 设置音乐的变速保调倍率；变化会清空时间伸缩状态，下次渲染按当前位置重新起段。
+    pub fn set_music_rate(&mut self, rate: MusicRate) {
+        self.music_rate = rate;
+        self.music_player.set_rate(rate);
+    }
+
+    pub fn music_rate(&self) -> MusicRate {
+        self.music_rate
+    }
+
+    /// 设置音乐音量（线性增益）。非有限值按静音处理。
+    pub fn set_music_gain(&mut self, gain: f64) {
+        self.music_gain = sanitize_gain(gain);
+    }
+
+    pub fn music_gain(&self) -> f64 {
+        self.music_gain
     }
 
     pub fn timeline(&self) -> &HitsoundTimeline {
@@ -90,10 +118,8 @@ impl HitsoundMixer {
         &self.library
     }
 
-    /// 可变访问样本库。
-    ///
-    /// 放入多个样本时应先全部放完，再调用一次 [`HitsoundMixer::rebuild_timeline`]：
-    /// 时间轴重建会遍历整张谱面，逐样本重建在样本多时是明显的浪费。
+    /// 可变访问样本库；批量放入样本后应一次性调用 [`HitsoundMixer::rebuild_timeline`]，
+    /// 避免逐样本重建整条时间轴。
     pub fn library_mut(&mut self) -> &mut SampleLibrary {
         &mut self.library
     }
@@ -108,9 +134,7 @@ impl HitsoundMixer {
         self.voices.clear();
     }
 
-    /// 用当前样本库重新生成事件时间轴。
-    ///
-    /// 会清空正在播放的声音：宿主应在加载样本的阶段调用，而不是播放中途。
+    /// 用当前样本库重新生成事件时间轴；会清空正在播放的声音，应在加载样本阶段调用。
     pub fn rebuild_timeline(&mut self, beatmap: &crate::domain::models::Beatmap) {
         let timeline = super::build_timeline(beatmap, &self.library);
         self.rebuild_timeline_events(timeline);
@@ -120,22 +144,16 @@ impl HitsoundMixer {
         self.position_ms
     }
 
-    /// 跳转到指定位置：丢弃所有正在播放的声音，并重新定位事件游标。
-    ///
-    /// 播放中途 seek 时已经越过的事件不会再补播，避免瞬间堆积大量声音。
+    /// 跳转到指定位置：丢弃正在播放的声音并重新定位事件游标，已越过的事件不再补播。
     pub fn seek(&mut self, position_ms: f64) {
         self.voices.clear();
         self.set_position(position_ms);
     }
 
-    /// 只移动播放位置与事件游标，已开始的声音继续播放。
+    /// 只移动播放位置与事件游标，已开始的声音继续播放（真正清空声音的 seek 用 [`Self::seek`]）。
     ///
-    /// 用于流式渲染时「把混音位置对齐到宿主提供的起点」：宿主负责决定要不要
-    /// 清空声音（真正的 seek 应调用 [`HitsoundMixer::seek`]）。
-    ///
-    /// 位置单位是谱面绝对时间，**允许为负**：离线导出可能从「首个物件前的预卷」开始
-    /// （视频区间起点为负），此时缓冲区第 0 帧必须对应那个负时刻，否则整段打击音
-    /// 会相对音乐与画面提前 |起点|。只有非有限值才回退到 0。
+    /// 位置允许为负：离线导出可能从首个物件前的预卷开始，此时第 0 帧必须对应那个负
+    /// 时刻，否则打击音相对音乐与画面提前；只有非有限值才回退到 0。
     pub fn set_position(&mut self, position_ms: f64) {
         self.position_ms = if position_ms.is_finite() {
             position_ms
@@ -148,10 +166,7 @@ impl HitsoundMixer {
             .partition_point(|event| event.start_ms < self.position_ms);
     }
 
-    /// 单调推进事件游标（不改变播放位置）。
-    ///
-    /// 流式渲染允许宿主从头重放同一个窗口（例如音频设备重排缓冲区），此时位置可能
-    /// 回退；这个方法保证已经排入的事件不会被重复触发。
+    /// 单调推进事件游标（不改变播放位置）：宿主重放同一窗口时已排入的事件不会被重复触发。
     pub fn advance_cursor_to(&mut self, position_ms: f64) {
         if !position_ms.is_finite() {
             return;
@@ -168,11 +183,8 @@ impl HitsoundMixer {
         self.voices.clear();
     }
 
-    /// 立即触发一个按名字查找的样本（只播一次）。
-    ///
-    /// 供游玩/回放使用：打击音由玩家输入驱动，而不是由时间轴驱动。声音从**当前
-    /// 混音位置**开始；返回 `false` 表示样本库没有这个名字（按静音处理），调用方
-    /// 不需要把它当成错误。
+    /// 立即触发一个按名字查找的样本（只播一次），供游玩/回放的输入驱动发声使用。
+    /// 声音从当前位置开始；返回 `false` 表示样本库没有这个名字（按静音处理）。
     pub fn trigger(&mut self, name: &str, gain: f64) -> bool {
         match self.library.id_of(name) {
             Some(source_id) => self.trigger_source(source_id, gain),
@@ -204,10 +216,8 @@ impl HitsoundMixer {
         true
     }
 
-    /// 开始一个循环音（滑条滑行、转盘旋转，或游玩时按住不放的持续音）。
-    ///
-    /// 样本自带循环长度时用它，否则整段样本循环。返回的句柄交给
-    /// [`HitsoundMixer::stop_loop`]；名字不存在或样本为空时返回 `None`。
+    /// 开始一个循环音（滑条滑行、转盘旋转等）：样本自带循环长度时用它，否则整段循环。
+    /// 返回的句柄交给 [`HitsoundMixer::stop_loop`]；名字不存在或样本为空时返回 `None`。
     pub fn start_loop(&mut self, name: &str, gain: f64) -> Option<LoopHandle> {
         let source_id = self.library.id_of(name)?;
         let (frames, _) = self.source_shape(source_id)?;
@@ -256,7 +266,7 @@ impl HitsoundMixer {
 
     fn take_voice_id(&mut self) -> u64 {
         let id = self.next_voice_id;
-        // 句柄只需要在本会话内唯一；绕回时跳过 0，避免和「没有句柄」混淆。
+        // 绕回时跳过 0，避免与「没有句柄」混淆。
         self.next_voice_id = self.next_voice_id.wrapping_add(1).max(1);
         id
     }
@@ -286,11 +296,8 @@ impl HitsoundMixer {
         let ms_per_frame = 1000.0 / self.sample_rate as f64;
         let window_end = window_start + frames as f64 * ms_per_frame;
 
-        // 收集本窗口内新开始的事件。
-        //
-        // 窗口是 `[start, end)`：正好落在 `window_end` 的事件留给下一个窗口。相邻窗口
-        // 首尾相接，所以它不会丢；反过来（在 `<=` 时收进来）会因为宿主每个窗口都用
-        // 窗口起点重新对齐事件游标，让同一个事件被收进两个声音、音量凭空翻倍。
+        // 收集本窗口内新开始的事件：窗口按 `[start, end)` 取，正好落在 `window_end` 的
+        // 留给下一个窗口（相邻窗口首尾相接不会丢）；收进来则会因游标对齐被放两次、音量翻倍。
         while self.next_event < self.timeline.events.len() {
             let event = self.timeline.events[self.next_event];
             if event.start_ms >= window_end {
@@ -325,10 +332,26 @@ impl HitsoundMixer {
         }
 
         let master = self.master_gain;
+        let music_gain = self.music_gain as f32;
+
+        // 背景音乐先整窗口渲染到 scratch：时间伸缩（WSOLA）有状态，必须按输出帧顺序
+        // 推进；音乐帧 = 谱面毫秒 × 音乐采样率 / 1000，负时间与曲末之后自然静音。
+        self.music_scratch.clear();
+        self.music_scratch.resize(frames * 2, 0.0);
+        if let Some(music) = &self.music {
+            self.music_player.render_at(
+                window_start,
+                music,
+                music.sample_rate,
+                frames,
+                &mut self.music_scratch,
+            );
+        }
+
         for (index, pair) in output.chunks_exact_mut(2).enumerate() {
             let frame_time = window_start + index as f64 * ms_per_frame;
-            let mut left = 0.0_f32;
-            let mut right = 0.0_f32;
+            let mut left = self.music_scratch[index * 2] * music_gain;
+            let mut right = self.music_scratch[index * 2 + 1] * music_gain;
 
             for voice in &self.voices {
                 if frame_time < voice.start_ms || frame_time >= voice.end_ms {
@@ -349,8 +372,8 @@ impl HitsoundMixer {
                     frames_in_source
                 };
 
-                // 直接按时间反推样本位置：与画面共用同一时间轴，避免累计漂移。
-                // 音高倍率随时间变化时位置取倍率对时间的积分，否则瞬时速度会随进度越跑越快。
+                // 按时间反推样本位置（与画面同一条时间轴，避免累计漂移）；音高倍率变化时
+                // 取倍率对时间的积分，否则瞬时速度会随进度越跑越快。
                 let elapsed = frame_time - voice.start_ms;
                 if elapsed < 0.0 {
                     continue;
@@ -372,12 +395,8 @@ impl HitsoundMixer {
             pair[1] = soft_limit(right);
         }
 
-        // 播放完的声音在下一窗口便宜地回收。
-        //
-        // 本窗口才开始的声音先留着（它们的数据可能正好跨到下一个窗口），其余按「数据
-        // 播完的时刻」判断：循环音看 `end_ms`（滑条/转盘的持续时长），普通打击音看
-        // `data_end_ms`。不做这一步，时长 0 的事件（`end_ms` 是无限）会永远留在列表里，
-        // 每个输出帧都要遍历一遍，长谱面会把混音拖到实时以下。
+        // 回收已播完的声音：本窗口才开始的先留着，其余按 min(end_ms, data_end_ms) 判断——
+        // 时长 0 的事件 end_ms 是无限，只看它会让声音列表无限增长，长谱面混音掉到实时以下。
         self.voices.retain(|voice| {
             voice.start_ms >= window_start || voice.end_ms.min(voice.data_end_ms) > window_end
         });
@@ -386,7 +405,7 @@ impl HitsoundMixer {
     }
 }
 
-/// 触发用的增益：非有限值按静音处理，其余夹到与主音量一致的范围内。
+/// 增益消毒：非有限值按静音处理，其余夹到 [0, 8]，坏输入不能让混音输出变 NaN 或爆音。
 fn sanitize_gain(gain: f64) -> f64 {
     if gain.is_finite() {
         gain.clamp(0.0, 8.0)
@@ -395,10 +414,8 @@ fn sanitize_gain(gain: f64) -> f64 {
     }
 }
 
-/// 软限幅：小信号近似线性，大信号平滑压缩到 ±1 以内。
-///
-/// osu! 允许打击音叠加，直接求和会削波；这里用有理函数近似 `tanh`，
-/// 比逐样本调用 `tanh` 便宜得多，且两端行为一致。
+/// 软限幅：小信号近似线性，大信号平滑压缩到 ±1；用有理函数近似 `tanh`，
+/// 比逐样本调用 `tanh` 便宜且两端行为一致。
 #[inline]
 pub(super) fn soft_limit(value: f32) -> f32 {
     if !value.is_finite() {
@@ -416,13 +433,11 @@ mod tests {
     use crate::hitsound::test_support::{beatmap_with, library_with, object_sample};
     use crate::hitsound::{PlayEvent, SampleData};
 
-    /// 构造一个「每 100ms 一个事件、样本 10ms」的样本库与时间轴。
-    ///
-    /// 事件间隔与窗口长度相同，因此每个事件都正好落在窗口边界上——这正是两条回归
-    /// 最容易被踩到的位置。
+    /// 构造「每 100ms 一个事件、样本 10ms」的混音器（测试辅助）：事件间隔与窗口
+    /// 长度相同，正好压在窗口边界上。
     fn click_mixer(events: usize) -> HitsoundMixer {
         let mut library = SampleLibrary::new();
-        // 1kHz 采样率，10 帧 = 10ms；样本值 1.0，增益 0.1，仍在软限幅的线性区。
+        // 1kHz 采样率（10 帧 = 10ms）；增益 0.1 仍在软限幅的线性区。
         library.insert("click", SampleData::stereo(vec![1.0; 20], 1000));
         let timeline = HitsoundTimeline {
             events: (0..events)
@@ -442,9 +457,7 @@ mod tests {
     /// 播完的声音会被回收。
     #[test]
     fn finished_voices_are_recycled() {
-        // 回归：时长 0 的事件 `end_ms` 是无限，只按它判断会让声音列表随播放无限增长；
-        // 每个输出帧都要遍历整张列表，长谱面会把混音拖到实时以下（Web 端表现为打击音
-        // 整体消失）。
+        // 回归：时长 0 的事件 end_ms 无限，声音列表仍必须能随播放回收。
         let mut mixer = click_mixer(200);
         for window in 0..200 {
             // 与宿主一致：每个窗口用窗口起点重新对齐事件游标。
@@ -461,8 +474,7 @@ mod tests {
     /// 落在窗口边界的事件只播一次。
     #[test]
     fn events_on_window_boundary_play_once() {
-        // 窗口是 `[start, end)`：正好在窗口末尾开始的事件必须留给下一个窗口。宿主每个
-        // 窗口都会用窗口起点重新对齐游标，边界事件若被收进两个窗口，音量会凭空翻倍。
+        // 回归：边界事件被两个窗口各收一次时音量会凭空翻倍。
         let mut mixer = click_mixer(11);
         let mut peak = 0.0_f32;
         for window in 0..20 {
@@ -481,7 +493,6 @@ mod tests {
     /// 显式触发的样本从当前位置开始出声。
     #[test]
     fn explicit_trigger_starts_at_current_position() {
-        // 游玩/回放场景：没有时间轴事件，声音完全由输入触发。
         let mut mixer = click_mixer(0);
         mixer.set_position(500.0);
         assert!(mixer.trigger("click", 0.1));
@@ -524,8 +535,7 @@ mod tests {
     /// 负位置把起点之前的预卷算进输出。
     #[test]
     fn negative_position_includes_pre_roll_in_output() {
-        // 离线导出可能从负的谱面时间开始（首个物件前的预卷）：位置为负时缓冲区第 0 帧
-        // 对应那个负时刻，0 之后的事件必须相应推后，否则整段打击音会提前。
+        // 负位置是预卷：缓冲区第 0 帧对应负时刻，事件相应推后，否则整段打击音会提前。
         let mut mixer = click_mixer(1);
         mixer.seek(-500.0);
         let output = mixer.render(1000);
@@ -539,8 +549,8 @@ mod tests {
     /// 样本采样率与混音采样率不同时按小数位置插值。
     #[test]
     fn sample_rate_mismatch_interpolates_fractionally() {
-        // 内嵌样本是 44.1kHz、MP4 导出是 48kHz，取最近帧会把高频镜像当信号；
-        // 这里用 2:1 的采样率差把插值关系钉死：位置依次是 0、0.5、1.0、1.5、2.0。
+        // 采样率不同（内嵌 44.1kHz、导出 48kHz）时按小数位置插值；2:1 采样率差把
+        // 采样位置依次钉死在 0、0.5、1.0、1.5、2.0。
         let mut library = SampleLibrary::new();
         library.insert("ramp", SampleData::mono(vec![0.0, 0.2, 0.0], 1000));
         let timeline = HitsoundTimeline {
@@ -570,10 +580,8 @@ mod tests {
     /// 升调斜坡按倍率积分推进样本位置。
     #[test]
     fn pitch_ramp_advances_sample_position_by_multiplier() {
-        // 回归：位置若按「瞬时倍率 × 经过时间」计算，瞬时播放速度会变成 f + t·f'，
-        // 转盘旋转音会比 osu! 的线性升调跑得更快。这里用一个单点脉冲把积分关系钉死：
-        // 倍率从 1.0 每毫秒 +0.001（上限 2.0），第 500 帧的积分恰好是 625，
-        // 因此第 625 帧的脉冲只能在第 500 帧被采到。
+        // 回归：位置取倍率对时间的积分（按「瞬时倍率 × 时间」会越跑越快）。倍率每毫秒
+        // +0.001、上限 2.0，第 500 帧的积分是 625，脉冲应恰好在输出第 500 帧被采到。
         let mut library = SampleLibrary::new();
         let mut frames = vec![0.0_f32; 2000];
         frames[625] = 1.0;
@@ -609,10 +617,8 @@ mod tests {
     /// 落在窗口边界的打击音不会被跳过。
     #[test]
     fn hitsound_on_window_boundary_is_not_skipped() {
-        // 回归：曾经用 `start_ms >= window_end` 收集事件，正好落在窗口末尾的事件
-        // 会被永久跳过（事件按开始时间升序，之后再也扫不到），表现为整点打击音静音。
+        // 回归：正好落在窗口末尾的事件留给下一个窗口，不能被永久跳过。
         let mut library = SampleLibrary::new();
-        // 采样率与混音一致（1000Hz），每个采样帧 1ms。
         library.insert(
             "normal-hitnormal",
             SampleData::stereo(vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 1000),
@@ -632,10 +638,9 @@ mod tests {
         assert_eq!(timeline.len(), 1);
 
         let mut mixer = HitsoundMixer::new(library, timeline, 1000);
-        // 第一个窗口 [0, 1000ms)：事件正好在末尾开始，本窗口内不应有声。
+        // 第一个窗口 [0, 1000ms) 内事件还没开始，第二个窗口必须能听到它。
         let first = mixer.render(1000);
         assert!(first.iter().all(|value| *value == 0.0));
-        // 第二个窗口 [1000, 2000ms)：必须能听到这个事件。
         let second = mixer.render(1000);
         assert!(
             second.iter().any(|value| *value > 0.0),
@@ -660,7 +665,7 @@ mod tests {
         );
         let timeline = build_timeline(&beatmap, &library);
 
-        // 样本采样率 1000Hz，每个采样帧 1ms；4 帧 = 4ms。
+        // 样本 1kHz 采样率（1 帧 = 1ms），4 帧 = 4ms。
         let mut mixer = HitsoundMixer::new(library, timeline, 1000);
         let quiet = mixer.render(2);
         assert_eq!(quiet.len(), 4);
@@ -704,5 +709,216 @@ mod tests {
         assert_eq!(mixer.master_gain(), 0.0);
         mixer.set_master_gain(-1.0);
         assert_eq!(mixer.master_gain(), 0.0);
+    }
+
+    /// 4 帧的递增音乐（每帧值 = 帧号），1kHz 输出下 1 帧 = 1ms。
+    fn ramp_music() -> SampleData {
+        SampleData::stereo(vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0], 1000)
+    }
+
+    /// 音乐按「谱面毫秒 × 采样率 / 1000」逐帧采样，音量走独立的音乐增益。
+    #[test]
+    fn music_mixes_at_chart_time_with_its_own_gain() {
+        let mut mixer = HitsoundMixer::new(SampleLibrary::new(), HitsoundTimeline::default(), 1000);
+        mixer.set_music(Some(ramp_music()));
+        mixer.set_music_gain(0.5);
+
+        let output = mixer.render(4);
+        for (index, pair) in output.chunks_exact(2).enumerate() {
+            let expected = soft_limit(index as f32 * 0.5);
+            assert!(
+                (pair[0] - expected).abs() < 1e-6,
+                "frame {index}: {}",
+                pair[0]
+            );
+            assert!(
+                (pair[1] - expected).abs() < 1e-6,
+                "frame {index}: {}",
+                pair[1]
+            );
+        }
+    }
+
+    /// 音乐在负时间（预卷）与曲末之后都是静音；seek 后从对应帧继续。
+    #[test]
+    fn music_is_silent_outside_and_follows_seek() {
+        let mut mixer = HitsoundMixer::new(SampleLibrary::new(), HitsoundTimeline::default(), 1000);
+        mixer.set_music(Some(ramp_music()));
+
+        // 预卷段：谱面时间 -2ms ~ 0ms，音乐还没开始。
+        mixer.seek(-2.0);
+        let pre_roll = mixer.render(2);
+        assert!(pre_roll.iter().all(|value| *value == 0.0), "{pre_roll:?}");
+
+        // seek 到 2ms：从音乐第 2 帧继续（输出经软限幅）。
+        mixer.seek(2.0);
+        let resumed = mixer.render(2);
+        assert!(
+            (resumed[0] - soft_limit(2.0)).abs() < 1e-6,
+            "{}",
+            resumed[0]
+        );
+        assert!(
+            (resumed[2] - soft_limit(3.0)).abs() < 1e-6,
+            "{}",
+            resumed[2]
+        );
+
+        // 曲末之后继续静音，不越界、不循环。
+        mixer.seek(5.0);
+        let after_end = mixer.render(2);
+        assert!(after_end.iter().all(|value| *value == 0.0), "{after_end:?}");
+    }
+
+    /// 音乐与打击音叠加后再统一限幅。
+    #[test]
+    fn music_and_hitsound_sum_before_limiting() {
+        let mut library = SampleLibrary::new();
+        library.insert("click", SampleData::stereo(vec![1.0; 4], 1000));
+        let timeline = HitsoundTimeline {
+            events: vec![PlayEvent {
+                start_ms: 0.0,
+                duration_ms: 0.0,
+                source_id: 0,
+                gain: 0.25,
+                looping: false,
+                frequency: PlayFrequency::UNITY,
+            }],
+        };
+        let mut mixer = HitsoundMixer::new(library, timeline, 1000);
+        mixer.set_music(Some(SampleData::stereo(vec![1.0; 4], 1000)));
+        mixer.set_music_gain(0.5);
+
+        let output = mixer.render(1);
+        let expected = soft_limit(0.25 + 0.5);
+        assert!((output[0] - expected).abs() < 1e-6, "{}", output[0]);
+        assert!((output[1] - expected).abs() < 1e-6, "{}", output[1]);
+    }
+
+    /// 音乐增益与主音量一样拒绝非有限值。
+    #[test]
+    fn music_gain_rejects_non_finite_values() {
+        let mut mixer = HitsoundMixer::new(SampleLibrary::new(), HitsoundTimeline::default(), 1000);
+        mixer.set_music_gain(f64::NAN);
+        assert_eq!(mixer.music_gain(), 0.0);
+        mixer.set_music_gain(f64::INFINITY);
+        assert_eq!(mixer.music_gain(), 0.0);
+    }
+
+    /// 设置时间伸缩倍率后，音乐内容按倍率推进（保调），而不是被重采样。
+    #[test]
+    fn music_rate_stretches_the_content() {
+        // 4 秒线性斜坡（每帧值 = 帧号 / 10000，足够小使软限幅近似线性），便于断言内容位置。
+        let samples: Vec<f32> = (0..4_000)
+            .flat_map(|index| {
+                let value = index as f32 / 10_000.0;
+                [value, value]
+            })
+            .collect();
+        let mut mixer = HitsoundMixer::new(SampleLibrary::new(), HitsoundTimeline::default(), 1000);
+        mixer.set_music(Some(SampleData::stereo(samples, 1000)));
+        mixer.set_music_rate(MusicRate {
+            resample: 1.0,
+            stretch: 2.0,
+        });
+        assert_eq!(
+            mixer.music_rate(),
+            MusicRate {
+                resample: 1.0,
+                stretch: 2.0
+            }
+        );
+
+        let output = mixer.render(3_000);
+        // 输出第 N 帧应该读到内容第 2N 帧（相似度搜索只允许几十帧的局部偏移）。
+        for frame in [10_usize, 500, 1_000, 1_500] {
+            let expected = soft_limit(frame as f32 * 2.0 / 10_000.0);
+            assert!(
+                (output[frame * 2] - expected).abs() < 0.01,
+                "输出帧 {frame}：{} vs {expected}",
+                output[frame * 2]
+            );
+        }
+        // 4 秒内容在 2 倍速下 2 秒后结束，之后是静音。
+        let tail = output[2_200 * 2..]
+            .iter()
+            .fold(0.0_f32, |acc, value| acc.max(value.abs()));
+        assert!(tail < 1e-3, "内容结束后仍有 {tail} 的残留");
+
+        // 恒等倍率下同样的源要 4 秒才结束，证明上面确实在做时间伸缩。
+        let mut identity =
+            HitsoundMixer::new(SampleLibrary::new(), HitsoundTimeline::default(), 1000);
+        identity.set_music(Some(SampleData::stereo(
+            (0..4_000)
+                .flat_map(|index| {
+                    let value = index as f32 / 10_000.0;
+                    [value, value]
+                })
+                .collect(),
+            1000,
+        )));
+        let plain = identity.render(3_000);
+        assert!(
+            plain[2_500 * 2] > 0.2,
+            "恒等倍率下 2500ms 处应当仍有内容：{}",
+            plain[2_500 * 2]
+        );
+    }
+
+    /// 实时链路（图表域输出 + 宿主按总倍率重采样）下 DT 保调：1kHz 正弦经 1.5 倍速后仍是 1kHz。
+    #[test]
+    fn realtime_chart_domain_keeps_dt_pitch() {
+        let rate = 48_000_u32;
+        // 2 秒的 1kHz 正弦（源采样率 = 输出采样率，便于断言）。
+        let source = SampleData::stereo(
+            (0..rate as usize * 2)
+                .flat_map(|index| {
+                    let value = (2.0 * std::f64::consts::PI * 1000.0 * index as f64 / rate as f64)
+                        .sin() as f32;
+                    [value, value]
+                })
+                .collect(),
+            rate,
+        );
+        let mut mixer = HitsoundMixer::new(SampleLibrary::new(), HitsoundTimeline::default(), rate);
+        mixer.set_music(Some(source));
+        // DT：总倍率 1.5 由宿主重采样，图表域要求「内容 1:1、音高 1/1.5」。
+        mixer.set_music_rate(MusicRate::chart_domain(1.5, 1.0));
+
+        let ring = mixer.render(rate as usize * 2);
+        // 交给宿主按总倍率线性重采样（与 `hitsound-worklet.js` 的消费方式一致）。
+        let ring_frames = ring.len() / 2;
+        let target = (ring_frames as f64 / 1.5) as usize;
+        let mut played = Vec::with_capacity(target);
+        let mut cursor = 0.0_f64;
+        while played.len() < target {
+            let base = (cursor.floor() as usize).min(ring_frames - 2);
+            let next = (base + 1).min(ring_frames - 1);
+            let fraction = (cursor - base as f64) as f32;
+            let left = ring[base * 2] + (ring[next * 2] - ring[base * 2]) * fraction;
+            played.push(left);
+            cursor += 1.5;
+        }
+
+        // 取中段（跳过伸缩起步的十几毫秒）做单频点幅度比较。
+        let window = &played[played.len() / 2 - 12_000..played.len() / 2 + 12_000];
+        let at_1000 = tone_magnitude(window, 1000.0, rate as f64);
+        let at_1500 = tone_magnitude(window, 1500.0, rate as f64);
+        assert!(
+            at_1000 > at_1500 * 8.0,
+            "DT 实时链路音高不保：1kHz={at_1000}, 1.5kHz={at_1500}"
+        );
+    }
+
+    /// 单个频点上的幅度（cos/sin 相关求和）。
+    fn tone_magnitude(samples: &[f32], frequency: f64, sample_rate: f64) -> f64 {
+        let omega = 2.0 * std::f64::consts::PI * frequency / sample_rate;
+        let (mut real, mut imaginary) = (0.0_f64, 0.0_f64);
+        for (index, value) in samples.iter().enumerate() {
+            let phase = omega * index as f64;
+            real += *value as f64 * phase.cos();
+            imaginary += *value as f64 * phase.sin();
+        }
+        (real * real + imaginary * imaginary).sqrt() / samples.len().max(1) as f64
     }
 }

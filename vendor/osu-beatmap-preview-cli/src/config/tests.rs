@@ -379,13 +379,25 @@ fn video_background_defaults_and_overlays_are_typed() {
     let defaults = load_snapshot(None).unwrap();
     assert!(defaults.render.standard.mp4.style.ENABLE_BACKGROUND_IMAGE);
     assert_eq!(defaults.render.standard.mp4.style.BACKGROUND_DIM, 0.7);
+    // 背景视频默认关闭：四模式的 mp4 小节各自带开关。
+    for enabled in [
+        defaults.render.standard.mp4.style.ENABLE_BACKGROUND_VIDEO,
+        defaults.render.taiko.mp4.style.ENABLE_BACKGROUND_VIDEO,
+        defaults.render.catch.mp4.style.ENABLE_BACKGROUND_VIDEO,
+        defaults.render.mania.mp4.style.ENABLE_BACKGROUND_VIDEO,
+    ] {
+        assert!(!enabled);
+    }
 
     let configured = load_snapshot(Some(
-            r#"{"render":{"standard":{"mp4":{"style":{"ENABLE_BACKGROUND_IMAGE":false,"BACKGROUND_DIM":0.25}}}}}"#,
+            r#"{"render":{"standard":{"mp4":{"style":{"ENABLE_BACKGROUND_IMAGE":false,"ENABLE_BACKGROUND_VIDEO":true,"BACKGROUND_DIM":0.25}}}}}"#,
         ))
         .unwrap();
     assert!(!configured.render.standard.mp4.style.ENABLE_BACKGROUND_IMAGE);
+    assert!(configured.render.standard.mp4.style.ENABLE_BACKGROUND_VIDEO);
     assert_eq!(configured.render.standard.mp4.style.BACKGROUND_DIM, 0.25);
+    // 未覆盖的模式保持默认关闭。
+    assert!(!configured.render.mania.mp4.style.ENABLE_BACKGROUND_VIDEO);
 }
 
 #[test]
@@ -855,4 +867,37 @@ fn configured_scale_and_fps_change_config_variant_hash() {
         fps.difference,
         serde_json::json!({"render": {"standard": {"gif": {"style": {"FPS": 30}}}}})
     );
+}
+
+/// 故事板开关：四模式 mp4 各自带 `ENABLE_STORYBOARD`、默认关闭；只对被覆盖的
+/// 模式生效，且开启后差异进入配置 hash（输出目录随之变化，符合「只有配置项
+/// 变更才能改变输出目录」的约定）。
+#[test]
+fn storyboard_toggle_defaults_off_and_enters_config_hash() {
+    let defaults = load_snapshot(None).unwrap();
+    for enabled in [
+        defaults.render.standard.mp4.style.ENABLE_STORYBOARD,
+        defaults.render.taiko.mp4.style.ENABLE_STORYBOARD,
+        defaults.render.catch.mp4.style.ENABLE_STORYBOARD,
+        defaults.render.mania.mp4.style.ENABLE_STORYBOARD,
+    ] {
+        assert!(!enabled);
+    }
+
+    let configured = load_snapshot(Some(
+        r#"{"render":{"standard":{"mp4":{"style":{"ENABLE_STORYBOARD":true}}}}}"#,
+    ))
+    .unwrap();
+    assert!(configured.render.standard.mp4.style.ENABLE_STORYBOARD);
+    assert!(!configured.render.mania.mp4.style.ENABLE_STORYBOARD);
+
+    let storyboard =
+        variant(r#"{"render":{"standard":{"mp4":{"style":{"ENABLE_STORYBOARD":true}}}}}"#).unwrap();
+    assert_eq!(
+        storyboard.difference,
+        serde_json::json!({"render": {"standard": {"mp4": {"style": {"ENABLE_STORYBOARD": true}}}}})
+    );
+    let hit =
+        variant(r#"{"render":{"standard":{"mp4":{"style":{"ENABLE_HITSOUND":false}}}}}"#).unwrap();
+    assert_ne!(storyboard.hash, hit.hash);
 }

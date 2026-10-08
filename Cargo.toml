@@ -1,6 +1,6 @@
 [package]
 name = "osu-beatmap-preview-py"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 license = "MIT"
 description = "Python bindings for osu-beatmap-preview"
@@ -16,14 +16,14 @@ default-members = ["."]
 resolver = "2"
 
 [dependencies]
-# 上游 v1.3.3：固定提交，确保各平台 wheel 使用相同的渲染实现。
-osu-beatmap-preview-core = { git = "https://github.com/2710165659/osu-beatmap-preview", rev = "73b4b9c0ce4d125e614eb38f106e2d0d80a9cb0c" }
-osu-beatmap-preview-cli = { git = "https://github.com/2710165659/osu-beatmap-preview", rev = "73b4b9c0ce4d125e614eb38f106e2d0d80a9cb0c" }
+# 上游 main（v1.4.0 之后）：固定最新提交，确保各平台 wheel 使用相同的渲染实现。
+osu-beatmap-preview-core = { git = "https://github.com/2710165659/osu-beatmap-preview", rev = "0045d40cdf5a0a6b5cfb7da502668b845fcd3024" }
+osu-beatmap-preview-cli = { git = "https://github.com/2710165659/osu-beatmap-preview", rev = "0045d40cdf5a0a6b5cfb7da502668b845fcd3024" }
 pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
 serde_json = "1"
 
 [patch."https://github.com/2710165659/osu-beatmap-preview"]
-# 四模式 HD/FL、默认红果配色和模组渲染修复随源码分发，避免只修改本机的 Cargo 缓存。
+# 渲染器及构建资源随源码分发，确保 Python sdist 可以独立构建。
 osu-beatmap-preview-core = { path = "vendor/osu-beatmap-preview-core" }
 osu-beatmap-preview-cli = { path = "vendor/osu-beatmap-preview-cli" }
 
