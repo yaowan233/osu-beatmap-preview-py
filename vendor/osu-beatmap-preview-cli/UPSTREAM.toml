@@ -1,5 +1,5 @@
 repository = "https://github.com/2710165659/osu-beatmap-preview"
-revision = "0045d40cdf5a0a6b5cfb7da502668b845fcd3024"
-version = "1.4.0"
+revision = "121f44a6fa5b988ce8db58d0a0005d06bb14e89e"
+version = "1.4.2"
 license = "MIT"
 changes = ["构建资源随 crate 分发，支持 Python sdist", "固定 crate 版本及 MIT 许可证", "保留 Rust 1.92 严格 Clippy 的兼容注解及跨平台测试适配"]

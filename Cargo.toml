@@ -1,6 +1,6 @@
 [package]
 name = "osu-beatmap-preview-py"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 license = "MIT"
 description = "Python bindings for osu-beatmap-preview"
@@ -16,9 +16,9 @@ default-members = ["."]
 resolver = "2"
 
 [dependencies]
-# 上游 main（v1.4.0 之后）：固定最新提交，确保各平台 wheel 使用相同的渲染实现。
-osu-beatmap-preview-core = { git = "https://github.com/2710165659/osu-beatmap-preview", rev = "0045d40cdf5a0a6b5cfb7da502668b845fcd3024" }
-osu-beatmap-preview-cli = { git = "https://github.com/2710165659/osu-beatmap-preview", rev = "0045d40cdf5a0a6b5cfb7da502668b845fcd3024" }
+# 上游 v1.4.2：固定发布提交，确保各平台 wheel 使用相同的渲染实现。
+osu-beatmap-preview-core = { git = "https://github.com/2710165659/osu-beatmap-preview", rev = "121f44a6fa5b988ce8db58d0a0005d06bb14e89e" }
+osu-beatmap-preview-cli = { git = "https://github.com/2710165659/osu-beatmap-preview", rev = "121f44a6fa5b988ce8db58d0a0005d06bb14e89e" }
 pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
 serde_json = "1"
 

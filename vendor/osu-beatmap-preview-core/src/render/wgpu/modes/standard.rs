@@ -11,8 +11,8 @@ use crate::render::canvas::Img;
 use crate::render::cpu::modes::standard::alpha::*;
 use crate::render::cpu::modes::standard::constants::*;
 use crate::render::cpu::modes::standard::context::{
-    apply_standard_object_mods, build_video_render_context, build_visible_indexes_by_snapshot,
-    py_round, stacked_position, standard_objects, to_frame_point, RenderCache, RenderContext,
+    apply_standard_object_mods, build_video_render_context, py_round, stacked_position,
+    standard_objects, to_frame_point, RenderCache, RenderContext, VisibleIndexCache,
 };
 use crate::render::cpu::modes::standard::follow_points::{
     build_sprite, follow_point_height, follow_point_position, follow_point_state,
@@ -101,14 +101,11 @@ pub fn prepare_realtime(
         .collect::<Vec<_>>();
     let breaks = prepare_breaks(&beatmap.break_periods, &context);
     let follow_points = prepare_follow_points(&context);
+    let visible_cache = VisibleIndexCache::new(&context.hit_objects, context.settings.preempt_ms);
     Ok(RealtimeFrameSource::new(
         GameMode::Standard,
         move |absolute_time_ms| {
-            let indexes = build_visible_indexes_by_snapshot(
-                &context.hit_objects,
-                &[absolute_time_ms],
-                context.settings.preempt_ms,
-            );
+            let indexes = visible_cache.at(absolute_time_ms);
             Ok(render_scene(
                 &context,
                 &sliders,
@@ -116,7 +113,7 @@ pub fn prepare_realtime(
                 &breaks,
                 &follow_points,
                 absolute_time_ms,
-                &indexes[0],
+                &indexes,
             ))
         },
     ))

@@ -171,6 +171,9 @@ pub struct RenderTaikoPngSizingConfig {
     pub INFO_MARGIN_LEFT: i64,
     pub LABEL_RIGHT_PADDING: i64,
     pub TIME_LABEL_FONT_SIZE: u32,
+    pub SWELL_HIT_COUNT_FONT_SIZE: u32,
+    pub SWELL_DURATION_FONT_SIZE: u32,
+    pub SWELL_DURATION_TOP_GAP: i64,
     pub TIME_LABEL_NOTE_FONT_SIZE: u32,
     pub BPM_FONT_SIZE: u32,
     pub TIME_LABEL_TOP_GAP: i64,
@@ -184,6 +187,8 @@ pub struct RenderTaikoPngSizingConfig {
 #[serde(deny_unknown_fields)]
 #[allow(dead_code, non_snake_case, non_camel_case_types)]
 pub struct RenderTaikoPngStyleConfig {
+    pub SWELL_COLOR: [u8; 3],
+    pub SWELL_TEXT_COLOR: [u8; 4],
     pub MAX_SUPPORTED_DURATION_MS: i64,
     pub ROW_WIDTH_MULTIPLIER_BPM_0_TO_180: f64,
     pub ROW_WIDTH_MULTIPLIER_BPM_180_TO_240: f64,
@@ -222,6 +227,8 @@ pub struct RenderTaikoGifStructureConfig {
 #[serde(deny_unknown_fields)]
 #[allow(dead_code, non_snake_case, non_camel_case_types)]
 pub struct RenderTaikoGifSizingConfig {
+    pub SWELL_HIT_COUNT_FONT_SIZE: u32,
+    pub SWELL_CLEAR_FONT_SIZE: u32,
     pub ROW_GAP: i64,
     pub PAGE_MARGIN_TOP: i64,
     pub PAGE_MARGIN_RIGHT: i64,
@@ -239,6 +246,13 @@ pub struct RenderTaikoGifSizingConfig {
 #[serde(deny_unknown_fields)]
 #[allow(dead_code, non_snake_case, non_camel_case_types)]
 pub struct RenderTaikoGifStyleConfig {
+    pub SWELL_COLOR: [u8; 4],
+    pub SWELL_TEXT_COLOR: [u8; 4],
+    pub SWELL_RING_THICKNESS_RATIO: f64,
+    pub SHOW_SWELL_MARKER: bool,
+    pub SHOW_SWELL_HIT_COUNT: bool,
+    pub SHOW_SWELL_APPROACH_CIRCLE: bool,
+    pub SHOW_SWELL_CLEAR: bool,
     pub IMAGE_BACKGROUND: [u8; 4],
     pub TRACK_BACKGROUND_COLOR: [u8; 4],
     pub TRACK_EDGE_COLOR: [u8; 4],
@@ -267,6 +281,8 @@ pub struct RenderTaikoGifConfig {
 #[serde(deny_unknown_fields)]
 #[allow(dead_code, non_snake_case, non_camel_case_types)]
 pub struct RenderTaikoMp4SizingConfig {
+    pub SWELL_HIT_COUNT_FONT_SIZE: u32,
+    pub SWELL_CLEAR_FONT_SIZE: u32,
     pub LABEL_FONT_SIZE: u32,
     pub LABEL_PAD: i64,
 }
@@ -275,6 +291,13 @@ pub struct RenderTaikoMp4SizingConfig {
 #[serde(deny_unknown_fields)]
 #[allow(dead_code, non_snake_case, non_camel_case_types)]
 pub struct RenderTaikoMp4StyleConfig {
+    pub SWELL_COLOR: [u8; 4],
+    pub SWELL_TEXT_COLOR: [u8; 4],
+    pub SWELL_RING_THICKNESS_RATIO: f64,
+    pub SHOW_SWELL_MARKER: bool,
+    pub SHOW_SWELL_HIT_COUNT: bool,
+    pub SHOW_SWELL_APPROACH_CIRCLE: bool,
+    pub SHOW_SWELL_CLEAR: bool,
     pub ENABLE_BACKGROUND_IMAGE: bool,
     pub ENABLE_BACKGROUND_VIDEO: bool,
     pub ENABLE_STORYBOARD: bool,
@@ -287,6 +310,7 @@ pub struct RenderTaikoMp4StyleConfig {
     pub TRACK_ACCENT_COLOR: [u8; 4],
     pub SHOW_MEASURE_LINES: bool,
     pub FPS: f64,
+    pub JUDGEMENT_LINE_COLOR: [u8; 4],
     pub ENABLE_HITSOUND: bool,
     pub ENABLE_BEATMAP_HITSOUND: bool,
     pub HITSOUND_VOLUME: i64,

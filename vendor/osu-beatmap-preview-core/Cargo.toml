@@ -1,6 +1,6 @@
 [package]
 name = "osu-beatmap-preview-core"
-version = "1.4.0"
+version = "1.4.2"
 edition = "2021"
 license = "MIT"
 publish = false
