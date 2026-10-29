@@ -1,10 +1,12 @@
 //! 渲染上下文、难度、皮肤、连击信息、行时间和可见索引。
 
+use crate::render::cpu::modes::standard::constants as standard_constants;
+
 use crate::domain::errors::{PreviewError, Result};
 use crate::domain::models::{Beatmap, BreakPeriod, HitObjects, StandardHitObject};
 use crate::domain::mods::ModSettings;
 use crate::domain::parser::round_half_even;
-use crate::domain::shared::time_selection::{PreviewTimeSelector, TimeAxis};
+use crate::domain::shared::time_selection::{PreviewTimeSelection, TimeAxis};
 use crate::render::canvas::Img;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
@@ -37,6 +39,13 @@ pub struct FrameLayout {
     pub content: crate::render::geometry::PixelRect,
 }
 
+impl FrameLayout {
+    /// 布局倍率包含 playfield 的 0.8 适配；HUD 使用适配前的输出倍率。
+    pub fn output_scale(&self) -> f64 {
+        self.scale / super::constants::PLAYFIELD_VIEWPORT_RATIO
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ComboInfo {
     pub color: [u8; 3],
@@ -50,6 +59,7 @@ pub struct RenderSettings {
     pub preempt_ms: i64,
     pub fade_in_ms: f64,
     pub hidden: bool,
+    pub hidden_only_approach: bool,
     pub traceable: bool,
 }
 
@@ -98,8 +108,8 @@ impl SharedBodyLayers {
         &self,
         index: usize,
         build: impl FnOnce() -> SliderRenderData,
-    ) -> Arc<SliderRenderData> {
-        Arc::clone(self.slider_data[index].get_or_init(|| Arc::new(build())))
+    ) -> &Arc<SliderRenderData> {
+        self.slider_data[index].get_or_init(|| Arc::new(build()))
     }
 }
 
@@ -151,12 +161,14 @@ pub struct RenderContext {
     pub follow_points: Vec<super::follow_points::FollowPoint>,
     pub skin: Skin,
     pub settings: RenderSettings,
+    pub style: crate::render::shared::standard::style::StandardRenderStyle,
     pub frame_layout: FrameLayout,
     pub frame_circle_diameter: i64,
     pub slider_body_width: i64,
     pub spinner_size: i64,
     pub spinner_od: f64,
     pub spinner_rate: f64,
+    pub spun_out: bool,
     pub slider_follow_size: i64,
     pub slider_ball_size: i64,
     pub slider_tick_rate: f64,
@@ -169,7 +181,7 @@ pub struct RenderContext {
     pub output_format: crate::render::geometry::OutputFormat,
     /// 等最终画布布局就绪后初始化，避免 MP4 居中偏移使自动光圈错位。
     pub flashlight: Option<super::visibility::StandardFlashlightCache>,
-    /// AT 的轨迹与精灵在最终布局确定后按需初始化，并跨导出线程共享。
+    /// 自动光标轨迹与精灵在最终布局确定后按需初始化，并跨导出线程共享。
     pub autoplay: Option<super::autoplay::AutoplayCache>,
     pub show_cursor: bool,
 }
@@ -196,27 +208,7 @@ pub fn apply_standard_object_mods(
     hit_objects: Vec<StandardHitObject>,
     mods: Option<&ModSettings>,
 ) -> Vec<StandardHitObject> {
-    let hard_rock = mods.map(|m| m.hard_rock).unwrap_or(false);
-    if !hard_rock {
-        return hit_objects;
-    }
-    hit_objects
-        .into_iter()
-        .map(|mut ho| {
-            ho.y = crate::render::cpu::modes::standard::constants::PLAYFIELD_HEIGHT as i32 - ho.y;
-            ho.slider_points = ho
-                .slider_points
-                .iter()
-                .map(|&(x, y)| {
-                    (
-                        x,
-                        crate::render::cpu::modes::standard::constants::PLAYFIELD_HEIGHT as i32 - y,
-                    )
-                })
-                .collect();
-            ho
-        })
-        .collect()
+    crate::domain::rulesets::standard::apply_object_mods(hit_objects, mods)
 }
 
 // ——— 难度 ———
@@ -281,6 +273,7 @@ pub fn build_render_settings(beatmap: &Beatmap, mods: Option<&ModSettings>) -> R
         preempt_ms,
         fade_in_ms,
         hidden,
+        hidden_only_approach: false,
         traceable,
     }
 }
@@ -398,18 +391,32 @@ pub fn load_skin(beatmap: &Beatmap) -> Skin {
 
 pub fn build_render_context(
     beatmap: &Beatmap,
-    mut hit_objects: Vec<StandardHitObject>,
+    hit_objects: Vec<StandardHitObject>,
     mods: Option<&ModSettings>,
     time_axis: TimeAxis,
     output_format: crate::render::geometry::OutputFormat,
 ) -> RenderContext {
+    build_context(beatmap, hit_objects, mods, time_axis, output_format, true)
+}
+
+fn build_context(
+    beatmap: &Beatmap,
+    mut hit_objects: Vec<StandardHitObject>,
+    mods: Option<&ModSettings>,
+    time_axis: TimeAxis,
+    output_format: crate::render::geometry::OutputFormat,
+    stack: bool,
+) -> RenderContext {
     let skin = load_skin(beatmap);
     let settings = build_render_settings(beatmap, mods);
-    super::stacking::apply_stacking(
-        &mut hit_objects,
-        beatmap.format_version(),
-        settings.preempt_ms as f32 * beatmap.stack_leniency() as f32,
-    );
+    let style = crate::render::shared::standard::style::StandardRenderStyle::current(output_format);
+    if stack {
+        super::stacking::apply_stacking(
+            &mut hit_objects,
+            beatmap.format_version(),
+            settings.preempt_ms as f32 * beatmap.stack_leniency() as f32,
+        );
+    }
     let frame_layout = build_frame_layout(output_format);
     let combo_info = build_combo_info(
         &hit_objects,
@@ -455,6 +462,7 @@ pub fn build_render_context(
         }
     }
     RenderContext {
+        style,
         spinner_od,
         spinner_rate: mods.map_or(1.0, |mods| mods.speed_multiplier),
         hit_objects,
@@ -494,10 +502,10 @@ pub fn build_render_context(
         flashlight: mods
             .is_some_and(|mods| mods.flashlight)
             .then(|| super::visibility::StandardFlashlightCache::new(&beatmap.break_periods)),
-        autoplay: mods
-            .is_some_and(|mods| mods.autoplay || mods.flashlight)
+        spun_out: mods.is_some_and(|mods| mods.spun_out),
+        autoplay: (style.show_cursor || mods.is_some_and(|mods| mods.flashlight))
             .then(super::autoplay::AutoplayCache::new),
-        show_cursor: mods.is_some_and(|mods| mods.autoplay),
+        show_cursor: style.show_cursor,
     }
 }
 
@@ -517,6 +525,40 @@ pub fn build_video_render_context(
     context
 }
 
+/// 回放使用准备层的稳定对象顺序和堆叠结果；只在这里生成像素缓存。
+#[cfg(feature = "replay")]
+pub fn build_replay_context(
+    beatmap: &Beatmap,
+    prepared: &crate::replay::preparation::standard::PreparedStandard,
+    time_axis: TimeAxis,
+    output_format: crate::render::geometry::OutputFormat,
+) -> RenderContext {
+    let objects = prepared
+        .objects
+        .iter()
+        .map(|object| {
+            let mut source = object.source.clone();
+            source.end_time = object.end.round_ties_even() as i64;
+            source
+        })
+        .collect();
+    let mut context = build_context(
+        beatmap,
+        objects,
+        Some(&prepared.mods.settings),
+        time_axis,
+        output_format,
+        false,
+    );
+    // 几何已翻转和堆叠，渲染只应用难度与可见性，禁止再次变换物件或光标。
+    context.autoplay = None;
+    context.flashlight = None;
+    context.show_cursor = false;
+    context.settings.hidden_only_approach = prepared.mods.hidden_only_approach;
+    context.frame_layout = super::osr::replay_layout(output_format);
+    context
+}
+
 // ——— 行时间 ———
 
 pub fn choose_row_start_times(
@@ -525,21 +567,14 @@ pub fn choose_row_start_times(
     row_count: usize,
     images_per_row: usize,
     ms_per_row_duration: i64,
-    requested_start_times: Option<Vec<i64>>,
+    selection: PreviewTimeSelection,
 ) -> Result<Vec<RowTiming>> {
     let row_duration = (images_per_row as i64 - 1) * ms_per_row_duration;
     let spans: Vec<(i64, i64)> = hit_objects
         .iter()
         .map(|o| (o.start_time, o.end_time))
         .collect();
-    let chosen = PreviewTimeSelector::new(
-        beatmap,
-        spans,
-        row_count,
-        row_duration,
-        requested_start_times,
-    )?
-    .choose()?;
+    let chosen = selection.choose(beatmap, spans, row_count, row_duration)?;
     Ok(chosen
         .into_iter()
         .map(|t| RowTiming {
@@ -553,15 +588,18 @@ pub fn choose_row_start_times(
 // ——— 画布尺寸 ———
 
 pub fn png_canvas_size() -> (i64, i64) {
+    let standard_png_sizing = standard_constants::png::sizing();
     let config = &crate::config::current().render.standard.png;
     let geometry =
         crate::render::geometry::standard_geometry(crate::render::geometry::OutputFormat::Png);
-    let unit_width =
-        geometry.content.width + config.sizing.INFO_MARGIN_LEFT + config.sizing.INFO_MARGIN_RIGHT;
-    let unit_height =
-        geometry.content.height + config.sizing.INFO_MARGIN_TOP + config.sizing.INFO_MARGIN_BOTTOM;
-    let width = config.sizing.PAGE_MARGIN_LEFT
-        + config.sizing.PAGE_MARGIN_RIGHT
+    let unit_width = geometry.content.width
+        + standard_png_sizing.INFO_MARGIN_LEFT
+        + standard_png_sizing.INFO_MARGIN_RIGHT;
+    let unit_height = geometry.content.height
+        + standard_png_sizing.INFO_MARGIN_TOP
+        + standard_png_sizing.INFO_MARGIN_BOTTOM;
+    let width = standard_png_sizing.PAGE_MARGIN_LEFT
+        + standard_png_sizing.PAGE_MARGIN_RIGHT
         + config.structure.IMAGES_PER_ROW as i64 * unit_width
         + (crate::config::current()
             .render
@@ -570,9 +608,9 @@ pub fn png_canvas_size() -> (i64, i64) {
             .structure
             .IMAGES_PER_ROW as i64
             - 1)
-            * config.sizing.COLUMN_GAP;
-    let height = config.sizing.PAGE_MARGIN_TOP
-        + config.sizing.PAGE_MARGIN_BOTTOM
+            * standard_png_sizing.COLUMN_GAP;
+    let height = standard_png_sizing.PAGE_MARGIN_TOP
+        + standard_png_sizing.PAGE_MARGIN_BOTTOM
         + config.structure.ROW_COUNT as i64 * unit_height
         + (crate::config::current()
             .render
@@ -581,36 +619,37 @@ pub fn png_canvas_size() -> (i64, i64) {
             .structure
             .ROW_COUNT as i64
             - 1)
-            * config.sizing.ROW_GAP;
+            * standard_png_sizing.ROW_GAP;
     (width, height)
 }
 
 pub fn gif_canvas_size() -> (i64, i64) {
+    let standard_gif_sizing = standard_constants::gif::sizing();
     let config = &crate::config::current().render.standard.gif;
     let geometry =
         crate::render::geometry::standard_geometry(crate::render::geometry::OutputFormat::Gif);
-    let unit_width =
-        geometry.content.width + config.sizing.INFO_MARGIN_LEFT + config.sizing.INFO_MARGIN_RIGHT;
-    // 时间标签关闭时，底部信息区和对应的单元步进都必须消失，保持旧行为。
-    let info_bottom = if config.style.SHOW_TIME_LABEL {
-        config.sizing.INFO_MARGIN_BOTTOM
+    let unit_width = geometry.content.width
+        + standard_gif_sizing.INFO_MARGIN_LEFT
+        + standard_gif_sizing.INFO_MARGIN_RIGHT;
+    let info_bottom = if standard_constants::gif::style::SHOW_TIME_LABEL {
+        standard_gif_sizing.INFO_MARGIN_BOTTOM
     } else {
         0
     };
-    let unit_height = geometry.content.height + config.sizing.INFO_MARGIN_TOP + info_bottom;
-    let width = config.sizing.PAGE_MARGIN_LEFT
-        + config.sizing.PAGE_MARGIN_RIGHT
+    let unit_height = geometry.content.height + standard_gif_sizing.INFO_MARGIN_TOP + info_bottom;
+    let width = standard_gif_sizing.PAGE_MARGIN_LEFT
+        + standard_gif_sizing.PAGE_MARGIN_RIGHT
         + config.structure.IMAGES_PER_ROW as i64 * unit_width
-        + (config.structure.IMAGES_PER_ROW as i64 - 1) * config.sizing.GRID_GAP;
-    let height = config.sizing.PAGE_MARGIN_TOP
-        + config.sizing.PAGE_MARGIN_BOTTOM
+        + (config.structure.IMAGES_PER_ROW as i64 - 1) * standard_gif_sizing.GRID_GAP;
+    let height = standard_gif_sizing.PAGE_MARGIN_TOP
+        + standard_gif_sizing.PAGE_MARGIN_BOTTOM
         + config.structure.ROW_COUNT as i64 * unit_height
-        + (config.structure.ROW_COUNT as i64 - 1) * config.sizing.GRID_GAP;
+        + (config.structure.ROW_COUNT as i64 - 1) * standard_gif_sizing.GRID_GAP;
     (width, height)
 }
 
 pub fn gif_frame_origin(segment_index: usize) -> (i64, i64) {
-    let config = &crate::config::current().render.standard.gif;
+    let standard_gif_sizing = standard_constants::gif::sizing();
     let geometry =
         crate::render::geometry::standard_geometry(crate::render::geometry::OutputFormat::Gif);
     let row_index = (segment_index
@@ -627,20 +666,21 @@ pub fn gif_frame_origin(segment_index: usize) -> (i64, i64) {
             .gif
             .structure
             .IMAGES_PER_ROW) as i64;
-    let unit_width =
-        geometry.content.width + config.sizing.INFO_MARGIN_LEFT + config.sizing.INFO_MARGIN_RIGHT;
-    let info_bottom = if config.style.SHOW_TIME_LABEL {
-        config.sizing.INFO_MARGIN_BOTTOM
+    let unit_width = geometry.content.width
+        + standard_gif_sizing.INFO_MARGIN_LEFT
+        + standard_gif_sizing.INFO_MARGIN_RIGHT;
+    let info_bottom = if standard_constants::gif::style::SHOW_TIME_LABEL {
+        standard_gif_sizing.INFO_MARGIN_BOTTOM
     } else {
         0
     };
-    let unit_height = geometry.content.height + config.sizing.INFO_MARGIN_TOP + info_bottom;
-    let x = config.sizing.PAGE_MARGIN_LEFT
-        + config.sizing.INFO_MARGIN_LEFT
-        + image_index * (unit_width + config.sizing.GRID_GAP);
-    let y = config.sizing.PAGE_MARGIN_TOP
-        + config.sizing.INFO_MARGIN_TOP
-        + row_index * (unit_height + config.sizing.GRID_GAP);
+    let unit_height = geometry.content.height + standard_gif_sizing.INFO_MARGIN_TOP + info_bottom;
+    let x = standard_gif_sizing.PAGE_MARGIN_LEFT
+        + standard_gif_sizing.INFO_MARGIN_LEFT
+        + image_index * (unit_width + standard_gif_sizing.GRID_GAP);
+    let y = standard_gif_sizing.PAGE_MARGIN_TOP
+        + standard_gif_sizing.INFO_MARGIN_TOP
+        + row_index * (unit_height + standard_gif_sizing.GRID_GAP);
     (x, y)
 }
 
@@ -690,37 +730,22 @@ pub fn build_visible_indexes_by_snapshot(
 
 /// 预先排序可见性边界，供实时渲染逐帧复用，避免每帧对整张谱面排序。
 pub struct VisibleIndexCache {
-    starts: Vec<(i64, usize)>,
-    end_times: Vec<i64>,
+    visibility: crate::render::shared::standard::visibility::ObjectVisibility,
 }
 
 impl VisibleIndexCache {
     pub fn new(hit_objects: &[StandardHitObject], preempt_ms: i64) -> Self {
-        let mut starts: Vec<_> = hit_objects
-            .iter()
-            .enumerate()
-            .map(|(i, o)| (o.start_time - preempt_ms, i))
-            .collect();
-        starts.sort_unstable();
-        let end_times = hit_objects.iter().map(visible_end_time).collect();
-        Self { starts, end_times }
+        Self {
+            visibility: crate::render::shared::standard::visibility::ObjectVisibility::new(
+                hit_objects.iter().enumerate().map(|(id, object)| {
+                    (object.start_time - preempt_ms, visible_end_time(object), id)
+                }),
+            ),
+        }
     }
 
     pub fn at(&self, snapshot_time: i64) -> Vec<usize> {
-        let mut active = Vec::new();
-        let start_count = self
-            .starts
-            .partition_point(|&(time, _)| time <= snapshot_time);
-        if start_count == 0 {
-            return active;
-        }
-        // 物件通常按时间排序；只需过滤仍未淡出的物件，避免维护逐帧可变集合。
-        for &(_, index) in self.starts[..start_count].iter().rev() {
-            if self.end_times[index] >= snapshot_time {
-                active.push(index);
-            }
-        }
-        active
+        self.visibility.at(snapshot_time).collect()
     }
 }
 
@@ -863,30 +888,30 @@ mod tests {
     }
 
     #[test]
-    fn hard_rock_flips_objects_before_stacking_and_offsetting() {
-        let mods = ModSettings {
-            hard_rock: true,
-            ..ModSettings::new()
-        };
-        let mut objects = apply_standard_object_mods(
-            vec![circle(100, 100, 1000), circle(100, 100, 1050)],
-            Some(&mods),
-        );
-        super::super::stacking::apply_stacking(&mut objects, 14, 100.0);
-
-        assert_eq!(objects[0].y, 284);
-        assert_eq!(objects[0].stack_height, 1);
+    fn coordinate_mods_flip_objects_before_stacking_and_offsetting() {
         let settings = RenderSettings {
             circle_diameter: 128,
             object_scale: 0.5,
             preempt_ms: 1200,
             fade_in_ms: 400.0,
             hidden: false,
+            hidden_only_approach: false,
             traceable: false,
         };
-        let (x, y) = stacked_position(&objects[0], &settings);
-        assert!((x - 96.8).abs() < 0.0001);
-        assert!((y - 280.8).abs() < 0.0001);
+        for (code, expected) in [("HR", (100, 284)), ("MR", (412, 100))] {
+            let mods = crate::domain::mods::parse_mods(&[code.into()]).unwrap();
+            let mut objects = apply_standard_object_mods(
+                vec![circle(100, 100, 1000), circle(100, 100, 1050)],
+                Some(&mods),
+            );
+            super::super::stacking::apply_stacking(&mut objects, 14, 100.0);
+
+            assert_eq!((objects[0].x, objects[0].y), expected, "{code}");
+            assert_eq!(objects[0].stack_height, 1);
+            let (x, y) = stacked_position(&objects[0], &settings);
+            assert!((x - (expected.0 as f64 - 3.2)).abs() < 0.0001, "{code}");
+            assert!((y - (expected.1 as f64 - 3.2)).abs() < 0.0001, "{code}");
+        }
     }
 
     #[test]

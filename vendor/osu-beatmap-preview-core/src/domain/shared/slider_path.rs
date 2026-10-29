@@ -168,6 +168,17 @@ pub fn build_catch_slider_path(
     slider_type: &str,
     pixel_length: f64,
 ) -> SliderPath {
+    build_lazer_slider_path(x, y, slider_points, slider_type, pixel_length)
+}
+
+/// Catch 与 Standard 回放共享 lazer 的完整逻辑路径，普通 Standard 预览继续使用原拟合。
+pub fn build_lazer_slider_path(
+    x: i32,
+    y: i32,
+    slider_points: &[(i32, i32)],
+    slider_type: &str,
+    pixel_length: f64,
+) -> SliderPath {
     let mut points: Vec<P> = Vec::with_capacity(slider_points.len() + 1);
     points.push((x as f64, y as f64));
     points.extend(slider_points.iter().map(|&(px, py)| (px as f64, py as f64)));
@@ -184,7 +195,7 @@ pub fn simplify_path(points: &[P], tolerance: f64) -> Vec<P> {
 
 /// 显示折线仍使用原始累计弧长。删除微小回绕只影响画面采样，不能压缩其时间；
 /// 例如同一小区域内的多次往返仍占用原来的进度区间，蛇入/蛇出不会提前跳过。
-fn simplify_timed_path(path: &SliderPath, tolerance: f64) -> SliderPath {
+pub(crate) fn simplify_timed_path(path: &SliderPath, tolerance: f64) -> SliderPath {
     let indices = simplify_indices(&path.points, tolerance);
     SliderPath {
         points: indices.iter().map(|&index| path.points[index]).collect(),

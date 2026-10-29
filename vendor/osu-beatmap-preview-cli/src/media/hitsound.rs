@@ -26,6 +26,58 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+pub(crate) mod osr {
+    //! 回放专用提示音和循环策略；普通谱面预览仍使用原样本集合与循环规则。
+    use super::*;
+
+    pub(crate) fn build_library(
+        beatmap_samples: Option<&Path>,
+        names: impl IntoIterator<Item = String>,
+    ) -> SampleLibrary {
+        let names: Vec<_> = names.into_iter().collect();
+        let mut library = build_library_with_names(beatmap_samples, names.iter().cloned());
+        for name in names {
+            if let Some(sample) = library.get(&name) {
+                if name.to_ascii_lowercase().contains("sliderwhistle") {
+                    let sample = sample.clone().with_loop(sample.frames());
+                    library.insert(name, sample);
+                }
+                continue;
+            }
+            let bytes: &[u8] = match name.as_str() {
+                "combobreak" => include_bytes!(
+                    "../../../osu-beatmap-preview-core/assets/hitsound/replay/combobreak.wav"
+                ),
+                "failsound" => include_bytes!(
+                    "../../../osu-beatmap-preview-core/assets/hitsound/replay/failsound.wav"
+                ),
+                _ => continue,
+            };
+            if let Ok(sample) = decode_sample(&name, bytes, Some("wav")) {
+                library.insert(name, sample);
+            }
+        }
+        library
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn replay_prompts_decode_and_whistle_loops_without_changing_preview_library() {
+            let names = ["combobreak", "failsound", "normal-sliderwhistle"].map(String::from);
+            let replay = build_library(None, names.clone());
+            for name in ["combobreak", "failsound"] {
+                assert!(replay.get(name).unwrap().frames() > 0);
+            }
+            let whistle = replay.get("normal-sliderwhistle").unwrap();
+            assert_eq!(whistle.loop_len, whistle.frames());
+            let preview = build_library_with_names(None, names);
+            assert!(!preview.contains("combobreak"));
+            assert_eq!(preview.get("normal-sliderwhistle").unwrap().loop_len, 0);
+        }
+    }
+}
 
 /// build.rs 生成的内嵌样本表。
 mod embedded {
@@ -138,14 +190,25 @@ pub(crate) fn build_library(
     beatmap_samples: Option<&Path>,
     nightcore: bool,
 ) -> SampleLibrary {
-    let mut archive = beatmap_samples.and_then(SampleArchive::open);
-    let mut library = SampleLibrary::new();
     let drum_names = nightcore
         .then_some(NIGHTCORE_SAMPLE_NAMES)
         .into_iter()
         .flatten()
         .map(str::to_string);
-    for name in referenced_names(beatmap).into_iter().chain(drum_names) {
+    build_library_with_names(
+        beatmap_samples,
+        referenced_names(beatmap).into_iter().chain(drum_names),
+    )
+}
+
+/// 回放仅预解码其真实事件引用的样本，普通预览沿用原来的候选集合。
+pub(crate) fn build_library_with_names(
+    beatmap_samples: Option<&Path>,
+    names: impl IntoIterator<Item = String>,
+) -> SampleLibrary {
+    let mut archive = beatmap_samples.and_then(SampleArchive::open);
+    let mut library = SampleLibrary::new();
+    for name in names {
         if let Some(archive) = archive.as_mut() {
             if let Some(index) = archive.find(&name) {
                 if let Some((bytes, extension)) = archive.extract(index) {

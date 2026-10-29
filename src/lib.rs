@@ -150,7 +150,7 @@ fn config_for_gap(config: Option<String>, gap: Option<f64>) -> PyResult<Option<S
     }
     Ok(Some(
         serde_json::json!({
-            "layout": {"taiko": {"png": {"SPACING_PER_BPM": gap}}}
+            "render": {"taiko": {"png": {"style": {"SPACING_PER_BPM": gap}}}}
         })
         .to_string(),
     ))

@@ -1,5 +1,7 @@
 //! osu!taiko PNG 静态图导出：计算行布局并交给 core 绘制，然后编码保存。
 
+use osu_beatmap_preview_core::render::cpu::modes::taiko::constants as taiko_constants;
+
 use crate::export::segment::{resolve_png_window, PngSegment, PngWindow};
 use crate::media::image;
 use osu_beatmap_preview_core::model::mods::ModSettings;
@@ -11,7 +13,6 @@ use osu_beatmap_preview_core::render::cpu::modes::taiko::png::{
 };
 use osu_beatmap_preview_core::support::error::{PreviewError, Result};
 use osu_beatmap_preview_core::support::timeout::RequestDeadline;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::timing::*;
@@ -108,11 +109,11 @@ pub(crate) fn render_taiko_grid(
         first_note_time,
         time_axis.to_display(chart_start_time),
     );
+    let beat_positions = png_beat_positions(&redline_sections, &mapper);
     let mut layout = build_png_layout(
-        effective_chart_end_time,
         mapper.end_position(),
-        &redline_sections,
         &timing_lines,
+        &beat_positions,
         chart_start_time,
     );
     layout.overall_difficulty = effective_overall_difficulty(beatmap, mods);
@@ -145,72 +146,146 @@ fn window_hit_objects(hit_objects: &mut Vec<TaikoHitObject>, window: PngWindow) 
     }
 }
 
-/// 计算每行的起始滚动位置，使行首对齐到小节线。
-///
-/// 从位置 0 开始，每行最多容纳 `max_row_width` 像素；下一行的起点取
-/// 「不超过 当前行起点 + max_row_width 的最后一条小节线」。如果该范围内
-/// 没有小节线（极端情况），则退化为定宽切分以保证推进。
-pub(crate) fn compute_row_start_positions(
+/// 常规每行四个完整小节；长拍号提前换行，单小节超宽时按拍线续行。
+/// 全部换行沿用原始坐标，不缩放行内音符。
+fn compute_row_start_positions(
     measure_positions: &[f64],
     chart_width: f64,
-    max_row_width: i64,
+    target_width: f64,
+    beat_positions: &[f64],
 ) -> Vec<f64> {
-    let mut starts = vec![0.0f64];
-    let width = max_row_width as f64;
-    loop {
-        let current = *starts.last().unwrap();
-        if current + width >= chart_width {
-            break;
+    let mut starts = vec![0.0];
+    let mut previous = 0.0;
+    let mut count = 0;
+    let mut continuing_long_measure = false;
+    for end in measure_positions
+        .iter()
+        .copied()
+        .chain(std::iter::once(chart_width))
+    {
+        if !end.is_finite() || end <= previous || end > chart_width {
+            continue;
         }
-        // 在 (current, current+width] 范围内找最后一条小节线作为下一行起点
-        let next = measure_positions
-            .iter()
-            .copied()
-            .filter(|&p| p > current + 1.0 && p <= current + width)
-            .fold(f64::NEG_INFINITY, f64::max);
-        if next.is_finite() {
-            starts.push(next);
+        if target_width.is_finite() && target_width > 0.0 && end - previous > target_width {
+            // 普通小节后单独开始续行；相邻长小节或红线切段不强制清空剩余行宽。
+            if !continuing_long_measure && previous > *starts.last().unwrap() {
+                starts.push(previous);
+            }
+            let mut start = *starts.last().unwrap();
+            // 连续累加拍长会有微小浮点误差，不能因此漏掉恰好位于行尾的拍线。
+            let tolerance = target_width * 1e-9;
+            while end - start > target_width + tolerance {
+                let limit = start + target_width;
+                let index =
+                    beat_positions.partition_point(|&position| position <= limit + tolerance);
+                let next = index
+                    .checked_sub(1)
+                    .map(|i| beat_positions[i])
+                    .filter(|&position| position.is_finite() && position > start)
+                    // 单拍也超宽或没有合法拍线时按行宽续行。
+                    .unwrap_or(limit);
+                starts.push(next);
+                start = next;
+            }
+            continuing_long_measure = true;
+            count = 0;
         } else {
-            starts.push(current + width);
+            if continuing_long_measure {
+                count = 1;
+                continuing_long_measure = false;
+            }
+            // 长拍号即使单小节未超宽，多个相邻小节也不能一起撑宽整图。
+            let start = *starts.last().unwrap();
+            if target_width.is_finite()
+                && target_width > 0.0
+                && end - start > target_width + target_width * 1e-9
+                && previous > start
+            {
+                starts.push(previous);
+                count = 0;
+            }
+            count += 1;
+            if count == 4 {
+                if end < chart_width {
+                    starts.push(end);
+                }
+                count = 0;
+            }
         }
+        previous = end;
     }
     starts
 }
 
+/// 单独生成换行拍线，避免将激昂/SV 标记误当拍线，也不受绘制用的最小拍线间距影响。
+fn png_beat_positions(sections: &[RedlineSection], mapper: &ScrollPositionMapper) -> Vec<f64> {
+    let mut positions = Vec::new();
+    for section in sections {
+        if !section.beat_length.is_finite() || section.beat_length <= 0.0 {
+            continue;
+        }
+        let first = ((-section.start_time as f64 / section.beat_length).ceil()).max(0.0) as i64;
+        let last =
+            ((section.end_time - section.start_time) as f64 / section.beat_length).floor() as i64;
+        for beat in first..=last {
+            let position =
+                mapper.position_at(section.start_time as f64 + beat as f64 * section.beat_length);
+            if positions.last().is_none_or(|&previous| position > previous) {
+                positions.push(position);
+            }
+        }
+    }
+    positions
+}
+
+/// 用四小节分组宽度的上四分位数作为目标，避免少数长拍号撑宽整图。
+/// 坐标来自同一滚动映射，不对行内音符做二次缩放。
+fn typical_row_width(measure_positions: &[f64], chart_width: f64) -> f64 {
+    let mut widths = Vec::new();
+    let mut start = 0.0;
+    let mut previous = 0.0;
+    let mut count = 0;
+    for &position in measure_positions {
+        if !position.is_finite() || position <= previous || position > chart_width {
+            continue;
+        }
+        previous = position;
+        count += 1;
+        if count == 4 {
+            widths.push(position - start);
+            start = position;
+            count = 0;
+        }
+    }
+    if widths.is_empty() {
+        return chart_width;
+    }
+    widths.sort_by(f64::total_cmp);
+    widths[(widths.len() - 1) * 3 / 4]
+}
+
 fn build_png_layout(
-    beatmap_duration: i64,
     chart_width: f64,
-    redline_sections: &[RedlineSection],
     timing_lines: &[TimingLine],
+    beat_positions: &[f64],
     chart_start_time: i64,
 ) -> TaikoPngLayout {
-    let base_row_width = resolve_base_row_width(beatmap_duration);
-    let bpm_width_multiplier = if crate::config::current()
-        .render
-        .taiko
-        .png
-        .style
-        .SPACING_PER_BPM
-        > 0.0
-    {
-        1.0
-    } else {
-        resolve_row_width_bpm_multiplier(redline_sections)
-    };
-    let max_row_width = pyround(base_row_width as f64 * bpm_width_multiplier);
-
-    // 行首对齐：以小节线位置作为换行锚点
+    let taiko_png_sizing = taiko_constants::png::sizing();
     let measure_positions: Vec<f64> = timing_lines
         .iter()
         .filter(|l| l.is_measure)
         .map(|l| l.position)
         .collect();
-    let row_start_positions =
-        compute_row_start_positions(&measure_positions, chart_width, max_row_width);
+    let target_width = typical_row_width(&measure_positions, chart_width);
+    let row_start_positions = compute_row_start_positions(
+        &measure_positions,
+        chart_width,
+        target_width,
+        beat_positions,
+    );
     let row_count = row_start_positions.len() as i64;
 
-    // 实际使用的最大行宽：小节对齐后每行都比 max_row_width 短，
-    // 画布宽度按真实内容收缩，避免右侧留下整片空白。
+    // 超长小节已按拍线续行，画布按实际最长行分配，不压缩音符间距。
     let mut used_row_width = 0.0f64;
     for (i, &start) in row_start_positions.iter().enumerate() {
         let end = if i + 1 < row_start_positions.len() {
@@ -220,37 +295,19 @@ fn build_png_layout(
         };
         used_row_width = used_row_width.max(end - start);
     }
-    let used_row_width = (used_row_width.ceil() as i64).clamp(1, max_row_width);
+    let used_row_width = (used_row_width.ceil() as i64).max(1);
+    let max_row_width = used_row_width;
 
-    let content_width = crate::config::current()
-        .render
-        .taiko
-        .png
-        .sizing
-        .ROW_INNER_PADDING_X
-        * 2
-        + used_row_width;
-    let image_width = crate::config::current()
-        .render
-        .taiko
-        .png
-        .sizing
-        .PAGE_MARGIN_LEFT
-        + crate::config::current()
-            .render
-            .taiko
-            .png
-            .sizing
-            .PAGE_MARGIN_RIGHT
-        + content_width;
-    let config = &crate::config::current().render.taiko.png;
-    let image_height = config.sizing.PAGE_MARGIN_TOP
-        + config.sizing.PAGE_MARGIN_BOTTOM
-        + config.sizing.INFO_MARGIN_TOP
-        + row_count * (config.sizing.ROW_HEIGHT + config.sizing.INFO_MARGIN_BOTTOM)
-        + (row_count - 1).max(0) * config.sizing.ROW_GAP;
+    let content_width = taiko_png_sizing.ROW_INNER_PADDING_X * 2 + used_row_width;
+    let image_width =
+        taiko_png_sizing.PAGE_MARGIN_LEFT + taiko_png_sizing.PAGE_MARGIN_RIGHT + content_width;
+    let image_height = taiko_png_sizing.PAGE_MARGIN_TOP
+        + taiko_png_sizing.PAGE_MARGIN_BOTTOM
+        + taiko_png_sizing.INFO_MARGIN_TOP
+        + row_count * (taiko_png_sizing.ROW_HEIGHT + taiko_png_sizing.INFO_MARGIN_BOTTOM)
+        + (row_count - 1).max(0) * taiko_png_sizing.ROW_GAP;
     let normal_note_diameter = pyround(
-        crate::config::current().render.taiko.png.sizing.ROW_HEIGHT as f64
+        taiko_png_sizing.ROW_HEIGHT as f64
             * crate::export::taiko::constants::NORMAL_NOTE_SIZE_RATIO,
     );
     let big_note_diameter =
@@ -269,163 +326,94 @@ fn build_png_layout(
     }
 }
 
-fn resolve_base_row_width(beatmap_duration: i64) -> i64 {
-    if beatmap_duration < 60_000 {
-        return crate::config::current()
-            .render
-            .taiko
-            .png
-            .sizing
-            .BASE_ROW_WIDTH_0_TO_1_MINUTES;
-    }
-    if beatmap_duration < 2 * 60_000 {
-        return crate::config::current()
-            .render
-            .taiko
-            .png
-            .sizing
-            .BASE_ROW_WIDTH_1_TO_2_MINUTES;
-    }
-    if beatmap_duration < 3 * 60_000 {
-        return crate::config::current()
-            .render
-            .taiko
-            .png
-            .sizing
-            .BASE_ROW_WIDTH_2_TO_3_MINUTES;
-    }
-    if beatmap_duration < 4 * 60_000 {
-        return crate::config::current()
-            .render
-            .taiko
-            .png
-            .sizing
-            .BASE_ROW_WIDTH_3_TO_4_MINUTES;
-    }
-    if beatmap_duration < 5 * 60_000 {
-        return crate::config::current()
-            .render
-            .taiko
-            .png
-            .sizing
-            .BASE_ROW_WIDTH_4_TO_5_MINUTES;
-    }
-    if beatmap_duration < 6 * 60_000 {
-        return crate::config::current()
-            .render
-            .taiko
-            .png
-            .sizing
-            .BASE_ROW_WIDTH_5_TO_6_MINUTES;
-    }
-    crate::config::current()
-        .render
-        .taiko
-        .png
-        .sizing
-        .BASE_ROW_WIDTH_6_TO_10_MINUTES
-}
-
-fn resolve_row_width_bpm_multiplier(redline_sections: &[RedlineSection]) -> f64 {
-    let main_bpm = resolve_main_bpm(redline_sections);
-    if main_bpm < 180.0 {
-        return crate::config::current()
-            .render
-            .taiko
-            .png
-            .style
-            .ROW_WIDTH_MULTIPLIER_BPM_0_TO_180;
-    }
-    if main_bpm < 240.0 {
-        return crate::config::current()
-            .render
-            .taiko
-            .png
-            .style
-            .ROW_WIDTH_MULTIPLIER_BPM_180_TO_240;
-    }
-    if main_bpm < 300.0 {
-        return crate::config::current()
-            .render
-            .taiko
-            .png
-            .style
-            .ROW_WIDTH_MULTIPLIER_BPM_240_TO_300;
-    }
-    crate::config::current()
-        .render
-        .taiko
-        .png
-        .style
-        .ROW_WIDTH_MULTIPLIER_BPM_300_PLUS
-}
-
-fn resolve_main_bpm(redline_sections: &[RedlineSection]) -> f64 {
-    // 按区段时长对四舍五入后的 BPM 加权，选择占比最大的值。
-    // 相同权重时取先插入的值，匹配 Python 按插入顺序执行 max 的行为。
-    let mut order: Vec<i64> = Vec::new();
-    let mut weighted: HashMap<i64, i64> = HashMap::new();
-    for section in redline_sections {
-        let bpm = pyround(60_000.0 / section.beat_length);
-        let duration = (section.end_time - section.start_time).max(0);
-        if !weighted.contains_key(&bpm) {
-            order.push(bpm);
-        }
-        *weighted.entry(bpm).or_insert(0) += duration;
-    }
-
-    if order.is_empty() {
-        return 120.0;
-    }
-    let mut best_bpm = order[0];
-    let mut best_duration = weighted[&order[0]];
-    for &bpm in &order[1..] {
-        if weighted[&bpm] > best_duration {
-            best_duration = weighted[&bpm];
-            best_bpm = bpm;
-        }
-    }
-    best_bpm as f64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn row_break_measure_anchors_are_scale_invariant_for_all_bpm_tiers() {
-        let logical_measures = [0.0, 600.0, 1_200.0, 1_800.0, 2_400.0, 3_000.0, 3_600.0];
-        let logical_chart_width = 3_900.0;
+    fn regular_measures_keep_four_per_row() {
+        let measures: Vec<_> = (0..=10).map(|i| i as f64 * 100.0).collect();
+        let width = typical_row_width(&measures, 950.0);
+        assert_eq!(width, 400.0);
+        assert_eq!(
+            compute_row_start_positions(&measures, 950.0, width, &[]),
+            vec![0.0, 400.0, 800.0]
+        );
+        assert_eq!(
+            compute_row_start_positions(&measures, 800.0, width, &[]),
+            vec![0.0, 400.0]
+        );
+    }
 
-        for multiplier in [1.0, 1.15, 1.3, 1.45] {
-            let logical_row_width = 1_300.0 * multiplier;
-            let baseline = compute_row_start_positions(
-                &logical_measures,
-                logical_chart_width,
-                osu_beatmap_preview_core::processing::parse::round_half_even(logical_row_width),
+    #[test]
+    fn variable_width_measures_keep_four_per_row_at_every_scale() {
+        let measures = [0.0, 100.0, 100.0, 250.0, 400.0, 700.0, 800.0];
+        for scale in [0.5, 1.0, 2.0] {
+            let scaled: Vec<_> = measures.iter().map(|p| p * scale).collect();
+            assert_eq!(
+                compute_row_start_positions(&scaled, 900.0 * scale, 800.0 * scale, &[]),
+                vec![0.0, 700.0 * scale]
             );
+        }
+        assert_eq!(
+            compute_row_start_positions(&[0.0, 600.0, 700.0], 800.0, 400.0, &[0.0, 300.0, 600.0]),
+            vec![0.0, 300.0, 700.0]
+        );
+        assert_eq!(
+            compute_row_start_positions(&[], 100.0, 400.0, &[]),
+            vec![0.0]
+        );
+    }
 
-            for scale in [0.5, 1.0, 1.5, 2.0] {
-                let measures: Vec<f64> = logical_measures
-                    .iter()
-                    .map(|position| position * scale)
-                    .collect();
-                let starts = compute_row_start_positions(
-                    &measures,
-                    logical_chart_width * scale,
-                    osu_beatmap_preview_core::processing::parse::round_half_even(
-                        logical_row_width * scale,
-                    ),
-                );
-
-                assert_eq!(starts.len(), baseline.len());
-                for (actual, expected) in starts.iter().zip(&baseline) {
-                    assert!((actual / scale - expected).abs() <= 1.0);
-                }
-            }
+    #[test]
+    fn exceptional_group_does_not_set_target_width() {
+        let mut measures: Vec<_> = (0..=16).map(|i| i as f64 * 100.0).collect();
+        measures.extend([2000.0, 2400.0, 2800.0, 3200.0]);
+        assert_eq!(typical_row_width(&measures, 3200.0), 400.0);
+    }
+    #[test]
+    fn long_measure_keeps_beat_on_row_edge_despite_roundoff() {
+        let beats: Vec<_> = (0..=64).map(|beat| beat as f64 * (1.0 + 1e-12)).collect();
+        let starts = compute_row_start_positions(&[0.0], 64.0, 16.0, &beats);
+        assert_eq!(starts.len(), 4);
+        for (index, start) in starts.iter().enumerate() {
+            assert!((start - index as f64 * 16.0).abs() < 1e-8);
         }
     }
 
+    #[test]
+    fn long_measure_continues_across_redline_without_short_row() {
+        // 对应末尾同 BPM 红线：30 拍后重新起算小节，但续行仍应填满 16 拍。
+        let beats: Vec<_> = (0..=62).map(|beat| beat as f64).collect();
+        assert_eq!(
+            compute_row_start_positions(&[0.0, 30.0], 62.0, 16.0, &beats),
+            vec![0.0, 16.0, 32.0, 48.0]
+        );
+    }
+
+    #[test]
+    fn adjacent_long_measures_do_not_expand_every_row() {
+        assert_eq!(
+            compute_row_start_positions(&[0.0, 400.0, 800.0, 1200.0], 1200.0, 400.0, &[]),
+            vec![0.0, 400.0, 800.0]
+        );
+    }
+
+    #[test]
+    fn oversized_measure_does_not_expand_every_row() {
+        let beats: Vec<_> = (0..=288).map(|i| i as f64 * 25.0).collect();
+        let starts = compute_row_start_positions(&[0.0, 400.0, 6800.0], 7200.0, 400.0, &beats);
+        assert!(starts.iter().all(|start| beats.contains(start)));
+        for pair in starts
+            .iter()
+            .copied()
+            .chain(std::iter::once(7200.0))
+            .collect::<Vec<_>>()
+            .windows(2)
+        {
+            assert!(pair[1] - pair[0] <= 400.0, "oversized row: {pair:?}");
+        }
+    }
     fn taiko_object(start_time: i64, end_time: i64) -> TaikoHitObject {
         TaikoHitObject {
             start_time,

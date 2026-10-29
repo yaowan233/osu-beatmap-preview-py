@@ -4,10 +4,9 @@
 Python 原生扩展。渲染器通过 PyO3 直接运行在 Python 进程内，不需要下载、配置或启动额外的
 可执行文件。
 
-> 当前为早期开发版本。0.1.10 使用上游 v1.4.2 的固定提交
-> [`121f44a`](https://github.com/2710165659/osu-beatmap-preview/commit/121f44a6fa5b988ce8db58d0a0005d06bb14e89e)。
+> 当前为早期开发版本。0.1.11 使用上游 main（v1.5.2 之后）的固定提交
+> [`4c1df8f`](https://github.com/2710165659/osu-beatmap-preview/commit/4c1df8f31eb89b93ff7667d570f6270a4bd6eaf3)。
 > core、CLI 和构建资源随仓库分发，确保各平台 wheel 使用相同的渲染行为。
-> 本次更新包含太鼓判定圆、完整空心转盘及击打数统计，Catch 自动接盘与 FL 跟随，以及故事板显示修复。
 
 ## 安装
 
@@ -67,10 +66,10 @@ result = await generate_preview_async(
 
 | 模式 | 支持的模组 |
 | --- | --- |
-| Standard | `EZ`、`HR`、`HD`、`FL`、`AT`、`TC`、`DA`、`DT`、`HT`、`NC`、`DC` |
+| Standard | `EZ`、`HR`、`HD`、`FL`、`MR`、`TC`、`DA`、`DT`、`HT`、`NC`、`DC` |
 | Taiko | `EZ`、`HR`、`HD`、`FL`、`SW`、`CS`、`DT`、`HT`、`NC`、`DC` |
-| Catch | `EZ`、`HR`、`HD`、`FL`、`AT`、`DT`、`HT`、`NC`、`DC` |
-| Mania | `HD`、`FL`、`1K`–`10K`、`DS`、`IN`、`HO`、`CS`、`DT`、`HT`、`NC`、`DC` |
+| Catch | `EZ`、`HR`、`HD`、`FL`、`DT`、`HT`、`NC`、`DC` |
+| Mania | `HD`、`FL`、`1K`–`10K`、`DS`、`IN`、`HO`、`MR`、`CS`、`DT`、`HT`、`NC`、`DC` |
 
 组合中的每个模组都必须受当前模式支持；Mania 的 `HD+FL` 互斥，其余三种模式可组合使用。
 `HD+TC`、`IN+HO`、`EZ+HR`、`DT+HT` 互斥；mania 的键数模组和 DS 只影响 standard 转谱。
@@ -79,7 +78,10 @@ GIF 和 MP4 使用相同的模组支持规则，GIF 在 15、30、60 fps 下也�
 `DT`/`HT` 的 MP4 音乐保调变速，可用 `dt1.25`、`ht0.9` 指定倍速；`NC`/`DC` 默认以
 1.5x / 0.75x 播放，也可指定倍速，音乐音高倍率固定为 1.5 / 0.75，`NC` 还叠加节拍鼓点。
 速度模组不能混用。
-Standard 的 `AT` 显示自动游玩光标，Catch 的 `AT` 显示自动接盘、Dash 拖尾和香蕉雨路线。
+`AT` 已移除。Standard 通过 `render.standard.<format>.style.SHOW_CURSOR` 显示自动光标；
+Catch 的 GIF / MP4 通过 `render.catch.<format>.style.SHOW_CATCHER` 显示自动接盘。
+太鼓 GIF / MP4 默认显示击打按键和音符击飞效果，可通过 `SHOW_KEY_OVERLAY`、`SHOW_HIT_EFFECTS` 控制。
+自定义配置请以 [当前上游配置](vendor/osu-beatmap-preview-core/assets/shared_config.yml) 为准，旧版部分排版、配色字段已移除。
 太鼓 PNG 转盘显示总击打数与时长，GIF 和 MP4 显示完整空心转盘、剩余击打数及完成淡出。
 四模式 MP4 可通过
 `render.<mode>.mp4.style.ENABLE_STORYBOARD` 和 `ENABLE_BACKGROUND_VIDEO` 启用故事板及背景视频，

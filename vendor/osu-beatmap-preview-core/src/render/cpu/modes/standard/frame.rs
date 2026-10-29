@@ -1,5 +1,9 @@
 //! 音符对象渲染：打击圈、滑条、转盘和接近圈。
 
+use crate::render::shared::standard::animation::{
+    break_alpha as break_overlay_alpha, break_remaining_ratio as break_remaining_bar_ratio,
+};
+
 use crate::model::{BreakPeriod, StandardHitObject};
 use crate::render::canvas::Img;
 
@@ -12,9 +16,9 @@ use super::follow_points::{
     build_sprite, follow_point_position, follow_point_state, sprite_height_key,
 };
 use super::slider::{
-    darken, draw_cached_slider_body, draw_ring_aa, draw_slider_ball, draw_slider_body,
-    draw_slider_reverse_arrows, draw_slider_ticks, fill_circle_gradient_aa, get_slider_render_data,
-    is_full_slider_body, resized_with_alpha, slider_snaked_range, with_alpha,
+    darken, draw_cached_slider_body, draw_ring_aa, draw_slider_body, draw_slider_reverse_arrows,
+    draw_slider_ticks, fill_circle_gradient_aa, get_slider_render_data, is_full_slider_body,
+    resized_with_alpha, slider_snaked_range, with_alpha,
 };
 use crate::render::text::{draw_text, text_size};
 
@@ -35,143 +39,13 @@ fn draw_centered_text(
     draw_text(canvas, text_x, y, text, size, color);
 }
 
-pub fn render_frame(
-    context: &RenderContext,
-    cache: &mut RenderCache,
-    snapshot_time: i64,
-    break_periods: &[BreakPeriod],
-    visible_indexes: &[usize],
-    background: Option<&Img>,
-) -> Img {
-    cache.prepare_for_context(context);
-    let mut frame = match background {
-        Some(background) => background.clone(),
-        None => {
-            let color = match context.output_format {
-                crate::render::geometry::OutputFormat::Png => {
-                    crate::config::current()
-                        .render
-                        .standard
-                        .png
-                        .style
-                        .IMAGE_BACKGROUND_COLOR
-                }
-                crate::render::geometry::OutputFormat::Gif => {
-                    crate::config::current()
-                        .render
-                        .standard
-                        .gif
-                        .style
-                        .IMAGE_BACKGROUND_COLOR
-                }
-                crate::render::geometry::OutputFormat::Mp4 => {
-                    crate::config::current()
-                        .render
-                        .standard
-                        .mp4
-                        .style
-                        .IMAGE_BACKGROUND_COLOR
-                }
-            };
-            // 视频物件层的帧是最终画布，底色只填内容框：内容框之外的补边仍由
-            // 合成阶段用画布底色处理，物件则可以溢出到画布边缘而不被切掉。
-            let content = context.frame_layout.content;
-            let mut frame = Img::new(
-                context.frame_layout.frame_width as u32,
-                context.frame_layout.frame_height as u32,
-                [0, 0, 0, 0],
-            );
-            frame.fill_rect_size(content.x, content.y, content.width, content.height, color);
-            frame
-        }
-    };
-
-    // 跟随点在游戏里位于物件层之下（`OsuPlayfield` 的 FollowPoints 早于
-    // HitObjectContainer），因此最先绘制，会被随后画出的物件覆盖。
-    draw_follow_points(&mut frame, context, cache, snapshot_time);
-
-    for &index in visible_indexes {
-        let hit_object = &context.hit_objects[index];
-        if hit_object.hit_type & 8 != 0 {
-            draw_spinner(&mut frame, context, cache, hit_object, snapshot_time);
-        } else if hit_object.hit_type & 2 != 0 {
-            draw_slider(&mut frame, context, cache, index, snapshot_time);
-        } else {
-            draw_hit_circle(&mut frame, context, cache, index, snapshot_time);
-        }
-    }
-
-    for &index in visible_indexes {
-        let hit_object = &context.hit_objects[index];
-        if hit_object.hit_type & 8 == 0 {
-            draw_approach_circle(
-                &mut frame,
-                context,
-                cache,
-                index,
-                context.combo_info[index].color,
-                snapshot_time,
-            );
-        }
-    }
-
-    if let Some(flashlight) = &context.flashlight {
-        let state = flashlight.get(context);
-        state.at(context, snapshot_time).apply(
-            &mut frame,
-            crate::render::geometry::PixelRect {
-                x: 0,
-                y: 0,
-                width: context.frame_layout.frame_width,
-                height: context.frame_layout.frame_height,
-            },
-        );
-    }
-
-    if let Some(current_break) = current_break_period(break_periods, snapshot_time) {
-        draw_break_overlay(&mut frame, current_break, snapshot_time, context);
-    }
-
-    if context.show_cursor {
-        if let Some(cache) = &context.autoplay {
-            let cursor = cache.get(context);
-            cursor.visit_trail(
-                snapshot_time,
-                context.frame_layout.scale,
-                |from, to, width, alpha| {
-                    frame.draw_line(
-                        from[0],
-                        from[1],
-                        to[0],
-                        to[1],
-                        width,
-                        [255, 255, 255, alpha],
-                    );
-                },
-            );
-            if let (Some(position), Some(sprite)) = (
-                cursor.position_at(snapshot_time),
-                cursor.sprite_at(snapshot_time),
-            ) {
-                frame.alpha_composite(
-                    sprite,
-                    py_round(position[0] - sprite.w as f64 / 2.0),
-                    py_round(position[1] - sprite.h as f64 / 2.0),
-                );
-            }
-        }
-    }
-
-    frame
-}
-
 // ——— 跟随点 ———
 
 /// 绘制当前时刻所有存活区间的跟随点。
 ///
 /// 每个跟随点的存活区间只有 preempt + TimeFadeIn（AR5 下 1.2 秒），比整条连接
 /// 短得多，因此逐帧扫描全部跟随点并跳过区间外的即可，不需要额外的索引结构。
-fn draw_follow_points(
+pub(super) fn draw_follow_points(
     frame: &mut Img,
     context: &RenderContext,
     cache: &mut RenderCache,
@@ -199,7 +73,7 @@ fn draw_follow_points(
 
 // ——— 打击圈 ———
 
-fn draw_hit_circle(
+pub(super) fn draw_hit_circle(
     frame: &mut Img,
     context: &RenderContext,
     cache: &mut RenderCache,
@@ -233,12 +107,25 @@ fn draw_hit_circle(
 
 // ——— 滑条 ———
 
-fn draw_slider(
+pub(super) fn draw_slider(
     frame: &mut Img,
     context: &RenderContext,
     cache: &mut RenderCache,
     index: usize,
     snapshot_time: i64,
+) {
+    draw_slider_state(frame, context, cache, index, snapshot_time, None, true);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_slider_state(
+    frame: &mut Img,
+    context: &RenderContext,
+    cache: &mut RenderCache,
+    index: usize,
+    snapshot_time: i64,
+    head_opacity: Option<f64>,
+    tracking: bool,
 ) {
     let hit_object = &context.hit_objects[index];
     let combo = context.combo_info[index];
@@ -267,8 +154,8 @@ fn draw_slider(
         let visible_path = slider_data.body_path(snaked_start, snaked_end);
         draw_slider_body(
             frame,
+            context,
             &visible_path,
-            context.slider_body_width,
             combo.color,
             alpha,
             context.settings.traceable,
@@ -297,7 +184,7 @@ fn draw_slider(
         combo.color,
         alpha,
     );
-    draw_slider_ball(
+    super::slider::draw_slider_ball_tracking(
         frame,
         context,
         cache,
@@ -306,14 +193,17 @@ fn draw_slider(
         snapshot_time,
         combo.color,
         overlay_alpha,
+        tracking,
     );
-    let head_alpha = slider_head_alpha(
-        hit_object,
-        snapshot_time,
-        &context.settings,
-        snaked_start,
-        snaked_end,
-    );
+    let head_alpha = head_opacity.unwrap_or_else(|| {
+        slider_head_alpha(
+            hit_object,
+            snapshot_time,
+            &context.settings,
+            snaked_start,
+            snaked_end,
+        )
+    });
     if head_alpha > 0.0 && !context.settings.traceable {
         draw_circle_piece(
             frame,
@@ -329,7 +219,7 @@ fn draw_slider(
 
 // ——— 转盘 ———
 
-fn draw_spinner(
+pub(super) fn draw_spinner(
     frame: &mut Img,
     context: &RenderContext,
     _cache: &mut RenderCache,
@@ -341,7 +231,7 @@ fn draw_spinner(
 
 // ——— 接近圈 ———
 
-fn draw_approach_circle(
+pub(super) fn draw_approach_circle(
     frame: &mut Img,
     context: &RenderContext,
     _cache: &mut RenderCache,
@@ -349,43 +239,29 @@ fn draw_approach_circle(
     color: [u8; 3],
     snapshot_time: i64,
 ) {
-    let hit_object = &context.hit_objects[index];
-    if context.settings.hidden {
+    let Some(approach) =
+        crate::render::shared::standard::animation::approach_circle(context, index, snapshot_time)
+    else {
         return;
-    }
-    if snapshot_time >= hit_object.start_time {
-        return;
-    }
-
-    let elapsed = (snapshot_time - (hit_object.start_time - context.settings.preempt_ms)) as f64;
-    let progress = (elapsed / context.settings.preempt_ms as f64).clamp(0.0, 1.0);
-    let alpha = 0.9 * (elapsed / (context.settings.fade_in_ms * 2.0).max(1.0)).min(1.0);
-    if alpha <= 0.0 {
-        return;
-    }
-    let approach_scale = 4.0 - 3.0 * progress;
-    let d = context.frame_circle_diameter as f64 * approach_scale;
-    let position = stacked_position(hit_object, &context.settings);
-    let center = to_frame_point(position.0, position.1, &context.frame_layout);
-    let thickness = (d * 0.03).max(1.0);
+    };
     draw_ring_aa(
         frame,
-        center.0,
-        center.1,
-        d / 2.0,
-        thickness,
+        approach.center.0,
+        approach.center.1,
+        approach.diameter / 2.0,
+        (approach.diameter * 0.03).max(1.0),
         [
             color[0],
             color[1],
             color[2],
-            super::slider::alpha_to_byte(alpha),
+            super::slider::alpha_to_byte(approach.opacity),
         ],
     );
 }
 
 // ——— 打击圈主体（打击圈 + 覆盖层 + 数字） ———
 
-fn draw_circle_piece(
+pub(super) fn draw_circle_piece(
     frame: &mut Img,
     context: &RenderContext,
     cache: &mut RenderCache,
@@ -501,13 +377,16 @@ fn draw_number(
 
 // ——— Break 覆盖层 ———
 
-fn current_break_period(break_periods: &[BreakPeriod], snapshot_time: i64) -> Option<&BreakPeriod> {
+pub(super) fn current_break_period(
+    break_periods: &[BreakPeriod],
+    snapshot_time: i64,
+) -> Option<&BreakPeriod> {
     break_periods
         .iter()
         .find(|p| break_overlay_alpha(p, snapshot_time) > 0.0)
 }
 
-fn draw_break_overlay(
+pub(super) fn draw_break_overlay(
     frame: &mut Img,
     break_period: &BreakPeriod,
     snapshot_time: i64,
@@ -521,10 +400,7 @@ fn draw_break_overlay(
     let mut layer = Img::new(frame.w, frame.h, [0, 0, 0, 0]);
     let center_x = context.frame_layout.frame_width as f64 / 2.0;
     let center_y = context.frame_layout.frame_height as f64 / 2.0;
-    let render_scale = crate::render::geometry::output_scale(
-        crate::render::geometry::GameMode::Standard,
-        context.output_format,
-    );
+    let render_scale = context.frame_layout.output_scale();
 
     draw_break_arrows(&mut layer, alpha, render_scale);
     draw_break_remaining_bar(
@@ -650,37 +526,9 @@ fn draw_chevron(
     layer.stroke_polyline(&[top, point, bottom], width, color, false);
 }
 
-fn break_overlay_alpha(break_period: &BreakPeriod, snapshot_time: i64) -> f64 {
-    if break_period.end_time - break_period.start_time < super::constants::BREAK_MIN_DURATION_MS {
-        return 0.0;
-    }
-    if snapshot_time < break_period.start_time || snapshot_time > break_period.end_time {
-        return 0.0;
-    }
-    if snapshot_time < break_period.start_time + super::constants::BREAK_FADE_DURATION_MS {
-        return (snapshot_time - break_period.start_time) as f64
-            / super::constants::BREAK_FADE_DURATION_MS as f64;
-    }
-    if snapshot_time > break_period.end_time - super::constants::BREAK_FADE_DURATION_MS {
-        return (break_period.end_time - snapshot_time) as f64
-            / super::constants::BREAK_FADE_DURATION_MS as f64;
-    }
-    1.0
-}
-
-fn break_remaining_bar_ratio(break_period: &BreakPeriod, snapshot_time: i64) -> f64 {
-    let effective_duration =
-        break_period.end_time - super::constants::BREAK_FADE_DURATION_MS - break_period.start_time;
-    if effective_duration <= 0 {
-        return 0.0;
-    }
-    let remaining =
-        break_period.end_time - super::constants::BREAK_FADE_DURATION_MS - snapshot_time;
-    (remaining as f64 / effective_duration as f64).clamp(0.0, 1.0)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::render_frame;
     use super::*;
     use crate::domain::models::{HitObjects, KvSection};
     use crate::domain::shared::time_selection::TimeAxis;

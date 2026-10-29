@@ -6,8 +6,8 @@ the MIT License:
 
 > Copyright (c) 2026 xuan_yuan
 
-The core and CLI crates are vendored from upstream v1.4.2 commit
-[`121f44a6fa5b988ce8db58d0a0005d06bb14e89e`](https://github.com/2710165659/osu-beatmap-preview/commit/121f44a6fa5b988ce8db58d0a0005d06bb14e89e),
+The core and CLI crates are vendored from upstream main commit (after v1.5.2)
+[`4c1df8f31eb89b93ff7667d570f6270a4bd6eaf3`](https://github.com/2710165659/osu-beatmap-preview/commit/4c1df8f31eb89b93ff7667d570f6270a4bd6eaf3),
 with self-contained build assets and compatibility annotations
 for the pinned Rust toolchain. The former rendering patches are included upstream.
 Each crate includes its complete MIT license and
@@ -18,3 +18,10 @@ https://github.com/ppy/osu/blob/master/osu.Game.Rulesets.Catch/Mods/CatchModHidd
 
 The default hyperdash outline colour follows the osu! skinning documentation:
 https://github.com/ppy/osu-wiki/blob/master/wiki/Skinning/skin.ini/en.md#catchthebeat
+
+Replay HUD assets retain their upstream licensing terms:
+
+- Torus Bold font and atlas from ppy osu-resources: the original [licence notice](vendor/osu-beatmap-preview-core/assets/fonts/argon/LICENCE) states that distribution requires a commercial licence.
+- Replay fallback sounds by ppy Pty Ltd (`combobreak.wav`, `failsound.wav`): [CC BY-NC 4.0](vendor/osu-beatmap-preview-core/assets/hitsound/replay/LICENCE.md).
+
+The package's MIT licence does not replace these asset licences.

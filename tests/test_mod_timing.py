@@ -42,14 +42,13 @@ objects = (
     f'[HitObjects]\\n{objects}\\n', encoding='utf-8'
 )
 name = {0: 'standard', 1: 'taiko', 3: 'mania'}[mode]
-structure = {'ROW_COUNT': 1} if mode == 1 else {'IMAGES_PER_ROW': 1}
-if mode == 0:
+structure = {'IMAGES_PER_ROW': 1}
+if mode != 3:
     structure['ROW_COUNT'] = 1
 config = json.dumps({
     'paths': {'CACHE_DIR': cache.parent.as_posix(), 'OUTPUT_DIR': (root / 'output').as_posix(),
               'LOG_DIR': (root / 'logs').as_posix()},
-    'render': {name: {'gif': {'SCALE': 0.5, 'structure': structure,
-                            'style': {'SHOW_TIME_LABEL': False}}}},
+    'render': {name: {'gif': {'SCALE': 0.5, 'structure': structure}}},
 })
 result = preview.generate_preview(
     999920001, format='gif', mods=mods, times='preview', duration_time=1, fps=fps, config=config
@@ -74,7 +73,7 @@ with Image.open(result['preview-img']) as image:
         (0, "hd+hr+dt"),
         (1, "sw+hr+cs+dt"),
         (3, "in+cs+ht"),
-        (0, "at+nc"),
+        (0, "mr+nc"),
         (1, "hd+dc"),
         (3, "fl+nc"),
     ],

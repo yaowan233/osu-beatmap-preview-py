@@ -2,6 +2,95 @@
 
 use super::music::{MusicPlayer, MusicRate};
 use super::{HitsoundTimeline, PlayFrequency, SampleData, SampleLibrary};
+#[cfg(feature = "replay")]
+mod osr {
+    //! 回放跳转恢复当前循环的原始起点与相位；普通预览的 seek 行为不变。
+    use super::*;
+
+    impl HitsoundMixer {
+        pub fn seek_replay(&mut self, position_ms: f64) {
+            self.seek(position_ms);
+            for index in 0..self.next_event {
+                let event = self.timeline.events[index];
+                if !event.looping
+                    || event.duration_ms <= 0.0
+                    || event.start_ms + event.duration_ms <= self.position_ms
+                {
+                    continue;
+                }
+                let Some(source) = self.library.sources.get(event.source_id) else {
+                    continue;
+                };
+                if source.frames() == 0 {
+                    continue;
+                }
+                let loop_len = source.loop_len;
+                let id = self.take_voice_id();
+                // 保留 start_ms 与 frequency.phase；把起点改为 seek 时刻会错误地重启音色。
+                self.voices.push(Voice {
+                    id,
+                    source_id: event.source_id,
+                    gain: event.gain,
+                    start_ms: event.start_ms,
+                    end_ms: event.start_ms + event.duration_ms,
+                    data_end_ms: f64::INFINITY,
+                    loop_len,
+                    frequency: event.frequency,
+                });
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::hitsound::PlayEvent;
+
+        #[test]
+        fn seek_preserves_loop_phase_omits_old_hits_and_stops_at_end() {
+            let mut library = SampleLibrary::new();
+            library.insert(
+                "loop",
+                SampleData::mono(vec![0.1, 0.2, 0.3, 0.4], 1000).with_loop(4),
+            );
+            library.insert("hit", SampleData::mono(vec![0.8; 20], 1000));
+            let timeline = HitsoundTimeline {
+                events: vec![
+                    PlayEvent {
+                        source_id: 0,
+                        start_ms: 0.0,
+                        duration_ms: 10.0,
+                        gain: 1.0,
+                        looping: true,
+                        frequency: PlayFrequency {
+                            phase: 1.0,
+                            ..PlayFrequency::UNITY
+                        },
+                    },
+                    PlayEvent {
+                        source_id: 1,
+                        start_ms: 0.0,
+                        duration_ms: 0.0,
+                        gain: 1.0,
+                        looping: false,
+                        frequency: PlayFrequency::UNITY,
+                    },
+                ],
+            };
+            let mut mixer = HitsoundMixer::new(library, timeline, 1000);
+            mixer.seek_replay(5.0);
+            let first = mixer.render(5);
+            assert!((first[0] - super::super::soft_limit(0.3)).abs() < 1e-6);
+            mixer.seek_replay(5.0);
+            assert_eq!(first, mixer.render(5));
+            mixer.seek_replay(10.0);
+            assert!(mixer.render(4).iter().all(|&value| value == 0.0));
+            // 原 seek 仍不恢复任何旧循环。
+            mixer.seek(5.0);
+            assert!(mixer.render(4).iter().all(|&value| value == 0.0));
+        }
+    }
+}
 
 /// 正在播放的一个声音。
 ///
@@ -309,7 +398,9 @@ impl HitsoundMixer {
                 Some(source) if source.frames() > 0 => (
                     0,
                     event.start_ms
-                        + source.frames() as f64 * 1000.0 / source.sample_rate.max(1) as f64,
+                        + event.frequency.time_to_reach(
+                            source.frames() as f64 * 1000.0 / source.sample_rate.max(1) as f64,
+                        ),
                 ),
                 // 缺失或空样本：立刻结束，不占用声音列表。
                 _ => (0, event.start_ms),
@@ -378,7 +469,9 @@ impl HitsoundMixer {
                 if elapsed < 0.0 {
                     continue;
                 }
-                let mut position = voice.frequency.integral(elapsed) * sample_rate / 1000.0;
+                let mut position = (voice.frequency.phase + voice.frequency.integral(elapsed))
+                    * sample_rate
+                    / 1000.0;
                 if loop_len > 0 {
                     position = position.rem_euclid(playable as f64);
                 } else if position >= playable as f64 {
@@ -907,6 +1000,56 @@ mod tests {
         assert!(
             at_1000 > at_1500 * 8.0,
             "DT 实时链路音高不保：1kHz={at_1000}, 1.5kHz={at_1500}"
+        );
+    }
+
+    /// 实时输出由 AudioWorklet 按 DT 速率重采样；谱面打击音需反向缩放频率，
+    /// 才能只缩短触发间隔而不抬高音高。
+    #[test]
+    fn realtime_chart_domain_keeps_hitsound_pitch() {
+        let rate = 48_000_u32;
+        let source = SampleData::stereo(
+            (0..rate as usize * 2)
+                .flat_map(|index| {
+                    let value = (2.0 * std::f64::consts::PI * 1000.0 * index as f64 / rate as f64)
+                        .sin() as f32;
+                    [value, value]
+                })
+                .collect(),
+            rate,
+        );
+        let mut library = SampleLibrary::new();
+        library.insert("hit", source);
+        let mut timeline = HitsoundTimeline {
+            events: vec![PlayEvent {
+                start_ms: 0.0,
+                duration_ms: 0.0,
+                source_id: 0,
+                gain: 1.0,
+                looping: false,
+                frequency: PlayFrequency::UNITY,
+            }],
+        };
+        timeline.scale_frequencies(1.0 / 1.5);
+        let mut mixer = HitsoundMixer::new(library, timeline, rate);
+        let ring = mixer.render(rate as usize * 3);
+        let ring_frames = ring.len() / 2;
+        let target = (ring_frames as f64 / 1.5) as usize;
+        let mut played = Vec::with_capacity(target);
+        let mut cursor = 0.0_f64;
+        while played.len() < target {
+            let base = (cursor.floor() as usize).min(ring_frames - 2);
+            let next = (base + 1).min(ring_frames - 1);
+            let fraction = (cursor - base as f64) as f32;
+            played.push(ring[base * 2] + (ring[next * 2] - ring[base * 2]) * fraction);
+            cursor += 1.5;
+        }
+        let window = &played[rate as usize / 2..rate as usize + rate as usize / 2];
+        let at_1000 = tone_magnitude(window, 1000.0, rate as f64);
+        let at_1500 = tone_magnitude(window, 1500.0, rate as f64);
+        assert!(
+            at_1000 > at_1500 * 8.0,
+            "DT 实时链路打击音音高不保：1kHz={at_1000}, 1.5kHz={at_1500}"
         );
     }
 

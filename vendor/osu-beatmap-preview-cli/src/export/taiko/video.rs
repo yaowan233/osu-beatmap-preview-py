@@ -1,8 +1,10 @@
-//! osu!taiko MP4 渲染器：完整谱面连续播放（无四行分段预览）。
+//! osu!taiko MP4 渲染器：完整谱面连续播放。
 //! 复用共享动画层的行背景和音符绘制，并使用单行布局；省略每段底部标签，
 //! 全局右上角标签由 `video::save_mp4_streamed` 绘制。
 //!
 //! 时间范围由 `--time-points` 和 `--duration-time` 控制。
+
+use osu_beatmap_preview_core::render::cpu::modes::taiko::constants as taiko_constants;
 
 use crate::export::canvas::Img;
 use crate::media::audio::AudioSourceJob;
@@ -90,6 +92,10 @@ pub(crate) fn render_taiko_video(
     // 播放倍率已由 snapshot_time 推进，不能再次缩放滚动窗口。
     let time_range = compute_time_range();
     let layout = build_video_layout(time_range);
+    let autoplay = osu_beatmap_preview_core::render::cpu::modes::taiko::autoplay::Autoplay::new(
+        &prepared_hit_objects,
+        &layout,
+    );
 
     let static_bg = {
         // 背景图在最终视频画布上统一处理；这里仅绘制 Taiko 自身的轨道面板。
@@ -108,12 +114,7 @@ pub(crate) fn render_taiko_video(
                 content.y,
                 content.width,
                 content.height,
-                crate::config::current()
-                    .render
-                    .taiko
-                    .mp4
-                    .style
-                    .IMAGE_BACKGROUND,
+                taiko_constants::mp4::style::IMAGE_BACKGROUND,
             );
         }
         draw_row_background(&mut bg, &layout, 0);
@@ -134,6 +135,13 @@ pub(crate) fn render_taiko_video(
                 &mut canvas,
                 &prepared_hit_objects,
                 &prepared_measure_lines,
+                &layout,
+                0,
+                snapshot_time,
+                &mut cache.borrow_mut(),
+            );
+            autoplay.draw(
+                &mut canvas,
                 &layout,
                 0,
                 snapshot_time,
@@ -175,7 +183,7 @@ pub(crate) fn render_taiko_video(
     )
 }
 
-/// MP4 的单行布局：帧尺寸为视频画布（物件只在视频边界被裁），单行内容带居中
+/// MP4 的单行布局：帧尺寸为视频画布（物件只在视频边界被裁），轨道位置与游戏一致
 ///（无四行堆叠、无行间距、无底部标签条）。
 fn build_video_layout(time_range: f64) -> AnimationLayout {
     build_video_animation_layout(time_range, crate::export::geometry::OutputFormat::Mp4)

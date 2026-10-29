@@ -43,14 +43,13 @@ objects = (
 )
 target = {'taiko': 1, 'ctb': 2, 'mania': 3}.get(convert, mode)
 name = {0: 'standard', 1: 'taiko', 2: 'catch', 3: 'mania'}[target]
-structure = {'ROW_COUNT': 1} if target == 1 else {'IMAGES_PER_ROW': 1}
-if target in (0, 2):
+structure = {'IMAGES_PER_ROW': 1}
+if target != 3:
     structure['ROW_COUNT'] = 1
 config = json.dumps({
     'paths': {'CACHE_DIR': cache.parent.as_posix(), 'OUTPUT_DIR': (root / 'output').as_posix(),
               'LOG_DIR': (root / 'logs').as_posix()},
-    'render': {name: {'gif': {'SCALE': 0.5, 'structure': structure,
-                            'style': {'SHOW_TIME_LABEL': False}}}},
+    'render': {name: {'gif': {'SCALE': 0.5, 'structure': structure}}},
 })
 baseline = '+'.join(token for token in mods.split('+') if token not in ('hd', 'fl')) or None
 frames = []
@@ -104,9 +103,7 @@ if target != 0:
         (0, "taiko", "hd+fl+hr+sw+dt"),
         (2, "", "fl+ez+ht"),
         (2, "", "hd+fl+hr+dt"),
-        (2, "", "at+fl+hr+dt"),
         (0, "ctb", "hd+fl+dt"),
-        (0, "ctb", "at+fl+dt"),
         (3, "", "hd+cs+ho+ht"),
         (3, "", "fl+cs+in+dt"),
         (0, "mania", "hd+4k+ds+cs+ht"),

@@ -32,7 +32,12 @@ pub fn autoplay_rotation(elapsed_ms: f64, rate: f64) -> f64 {
     elapsed_ms.max(0.0) * 0.05 / rate
 }
 
-fn pieces(context: &RenderContext, object: &StandardHitObject, time: i64) -> Vec<Piece> {
+fn pieces(
+    context: &RenderContext,
+    object: &StandardHitObject,
+    time: i64,
+    replay: Option<(f64, f64, f64)>,
+) -> Vec<Piece> {
     let preempt = context.settings.preempt_ms.max(1) as f64;
     let elapsed = (time - object.start_time) as f64;
     let duration = (object.end_time - object.start_time).max(1) as f64;
@@ -45,10 +50,7 @@ fn pieces(context: &RenderContext, object: &StandardHitObject, time: i64) -> Vec
     if alpha <= 0.0 {
         return Vec::new();
     }
-    let scale = crate::render::geometry::output_scale(
-        crate::render::geometry::GameMode::Standard,
-        context.output_format,
-    );
+    let scale = context.frame_layout.output_scale();
     let entry = out_quint((elapsed + preempt / 2.0) / (preempt / 4.0));
     let grow = out_quint(elapsed / (preempt / 2.0));
     let disc_scale = 0.2 * entry + 0.8 * grow;
@@ -57,10 +59,21 @@ fn pieces(context: &RenderContext, object: &StandardHitObject, time: i64) -> Vec
     if radius <= 0.0 {
         return Vec::new();
     }
-    let rotation = autoplay_rotation(elapsed.clamp(0.0, duration), context.spinner_rate);
-    let spins = rotation / TAU;
     let required =
         (difficulty(context.spinner_od, 90.0, 150.0, 225.0) / 60000.0 * duration + 0.0001).floor();
+    let rotation = replay.map_or_else(
+        || {
+            if context.spun_out {
+                // SO 以完成所需圈数为目标，并像官方一样去掉音乐倍速。
+                elapsed.clamp(0.0, duration) / context.spinner_rate * 1.01 * required / duration
+                    * TAU
+            } else {
+                autoplay_rotation(elapsed.clamp(0.0, duration), context.spinner_rate)
+            }
+        },
+        |r| r.0,
+    );
+    let spins = replay.map_or(rotation / TAU, |r| r.1);
     let progress = if required <= 0.0 {
         1.0
     } else {
@@ -160,7 +173,13 @@ fn pieces(context: &RenderContext, object: &StandardHitObject, time: i64) -> Vec
     result.push(Piece::Ring(centre_radius * 0.8, 10.0 * scale, white));
     result.push(Piece::Ring(centre_radius, 3.0 * scale, white));
     if elapsed >= 0.0 {
-        result.push(Piece::Text("477".into(), 60.0 * scale, 28, 1.0, white));
+        result.push(Piece::Text(
+            replay.map_or("477".into(), |r| format!("{:.0}", r.2)),
+            60.0 * scale,
+            28,
+            1.0,
+            white,
+        ));
         result.push(Piece::Text(
             "SPINS PER MINUTE".into(),
             90.0 * scale,
@@ -201,12 +220,20 @@ fn pieces(context: &RenderContext, object: &StandardHitObject, time: i64) -> Vec
 }
 
 pub fn draw_cpu(frame: &mut Img, context: &RenderContext, object: &StandardHitObject, time: i64) {
+    draw_cpu_state(frame, context, object, time, None);
+}
+
+/// 回放旋转角、累计圈数和转速来自规则轨迹，不能套用 Autoplay。
+pub(super) fn draw_cpu_state(
+    frame: &mut Img,
+    context: &RenderContext,
+    object: &StandardHitObject,
+    time: i64,
+    replay: Option<(f64, f64, f64)>,
+) {
     let (x, y) = to_frame_point(256.0, 192.0, &context.frame_layout);
-    let scale = crate::render::geometry::output_scale(
-        crate::render::geometry::GameMode::Standard,
-        context.output_format,
-    );
-    for piece in pieces(context, object, time) {
+    let scale = context.frame_layout.output_scale();
+    for piece in pieces(context, object, time, replay) {
         match piece {
             Piece::Circle(r, c) => frame.fill_circle_aa(x, y, r, c),
             Piece::Ring(r, w, c) => draw_ring_aa(frame, x, y, r, w, c),
@@ -230,12 +257,20 @@ pub fn draw_gpu(
     object: &StandardHitObject,
     time: i64,
 ) {
+    draw_gpu_state(scene, context, object, time, None);
+}
+
+/// 回放旋转轨迹与普通预览共用盘面绘制，状态只改变角度和转速。
+pub fn draw_gpu_state(
+    scene: &mut FrameSceneBuilder,
+    context: &RenderContext,
+    object: &StandardHitObject,
+    time: i64,
+    rotation: Option<(f64, f64, f64)>,
+) {
     let (x, y) = to_frame_point(256.0, 192.0, &context.frame_layout);
-    let scale = crate::render::geometry::output_scale(
-        crate::render::geometry::GameMode::Standard,
-        context.output_format,
-    );
-    for piece in pieces(context, object, time) {
+    let scale = context.frame_layout.output_scale();
+    for piece in pieces(context, object, time, rotation) {
         match piece {
             Piece::Circle(r, c) => scene.circle([x as f32, y as f32], r as f32, c),
             Piece::Ring(r, w, c) => scene.ring([x as f32, y as f32], r as f32, w as f32, c),

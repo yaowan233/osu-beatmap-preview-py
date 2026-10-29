@@ -7,7 +7,8 @@
 use crate::render::canvas::{Img, Rgba};
 use font8x8::legacy::BASIC_LEGACY;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 // ─── 字形查找 ───
 
@@ -156,6 +157,84 @@ pub fn render_text_sprite(text: &str, size: u32, color: Rgba) -> Img {
     img
 }
 
+/// 复用整段文字的图像身份，使 GPU 贴图缓存能跨帧命中。
+/// 队列限制条数与像素总量，动态计分文字不会无限积累。
+pub fn shared_text_sprite(text: &str, size: u32, color: Rgba) -> Arc<Img> {
+    type TextKey = (String, u32, Rgba);
+    thread_local! {
+        static CACHE: RefCell<VecDeque<(TextKey, Arc<Img>)>> = const { RefCell::new(VecDeque::new()) };
+    }
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(index) = cache.iter().position(|((value, height, tint), _)| {
+            value == text && *height == size && *tint == color
+        }) {
+            let entry = cache.remove(index).unwrap();
+            let image = Arc::clone(&entry.1);
+            cache.push_back(entry);
+            return image;
+        }
+        let image = Arc::new(render_text_sprite(text, size, color));
+        let pixels = |image: &Img| image.w as usize * image.h as usize;
+        let image_pixels = pixels(&image);
+        const MAX_PIXELS: usize = 512 * 1024;
+        if image_pixels <= MAX_PIXELS {
+            let mut used = cache.iter().map(|(_, image)| pixels(image)).sum::<usize>();
+            while cache.len() >= 64 || used + image_pixels > MAX_PIXELS {
+                used -= pixels(&cache.pop_front().unwrap().1);
+            }
+            cache.push_back(((text.to_owned(), size, color), Arc::clone(&image)));
+        }
+        image
+    })
+}
+
+/// 在指定内容宽度内以 `(x, y)` 为基准水平居中绘制文字。
+fn draw_centered_text(
+    canvas: &mut Img,
+    text: &str,
+    x: i64,
+    y: i64,
+    size: u32,
+    color: [u8; 4],
+    content_width: i64,
+) {
+    let (text_w, _) = text_size(text, size);
+    let text_x = x + (content_width - text_w as i64) / 2;
+    draw_text(canvas, text_x, y, text, size, color);
+}
+
+/// 在 `(x, y)` 下方居中绘制时间标签及可选提示文字。
+#[allow(clippy::too_many_arguments)]
+pub fn draw_time_label(
+    canvas: &mut Img,
+    label: &str,
+    x: i64,
+    y: i64,
+    note: Option<&str>,
+    content_width: i64,
+    label_size: u32,
+    note_size: u32,
+    note_top_gap: i64,
+    label_color: [u8; 4],
+    note_color: [u8; 4],
+) {
+    draw_centered_text(canvas, label, x, y, label_size, label_color, content_width);
+    if let Some(note_text) = note {
+        let (_, label_h) = text_size(label, label_size);
+        let note_y = y + label_h as i64 + note_top_gap;
+        draw_centered_text(
+            canvas,
+            note_text,
+            x,
+            note_y,
+            note_size,
+            note_color,
+            content_width,
+        );
+    }
+}
+
 pub fn format_mmssmmm(ms: i64) -> String {
     let sign = if ms < 0 { "-" } else { "" };
     let magnitude = ms.unsigned_abs();
@@ -181,6 +260,23 @@ pub fn format_seconds_tenths(ms: i64) -> String {
 #[cfg(test)]
 mod time_format_tests {
     use super::*;
+
+    #[test]
+    fn shared_text_keeps_identity_and_respects_style() {
+        let first = shared_text_sprite("00:01", 18, [255; 4]);
+        assert!(Arc::ptr_eq(
+            &first,
+            &shared_text_sprite("00:01", 18, [255; 4])
+        ));
+        for other in [
+            shared_text_sprite("00:02", 18, [255; 4]),
+            shared_text_sprite("00:01", 27, [255; 4]),
+            shared_text_sprite("00:01", 18, [100; 4]),
+        ] {
+            assert!(!Arc::ptr_eq(&first, &other));
+        }
+        assert_eq!(first.data, render_text_sprite("00:01", 18, [255; 4]).data);
+    }
 
     #[test]
     fn formats_signed_millisecond_times() {

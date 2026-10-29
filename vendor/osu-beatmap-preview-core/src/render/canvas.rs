@@ -1,5 +1,7 @@
 //! RGBA8 图像类型，提供兼容 PIL 的 alpha 合成、Lanczos 缩放、旋转和二维绘图原语。
 
+use wide::{f32x4, CmpGe};
+
 #[derive(Debug, Clone)]
 pub struct Img {
     pub w: u32,
@@ -8,6 +10,27 @@ pub struct Img {
 }
 
 pub type Rgba = [u8; 4];
+
+pub const BLACK_OPAQUE: Rgba = [0, 0, 0, 255];
+
+/// 对非负颜色通道饱和取整，保持标量 `round().clamp()` 的半整数行为。
+#[inline]
+pub(crate) fn round_channels(values: f32x4) -> f32x4 {
+    let values = values.max(f32x4::ZERO).min(f32x4::splat(255.0));
+    let integers = values.trunc_int().round_float();
+    integers
+        + (values - integers)
+            .cmp_ge(f32x4::splat(0.5))
+            .blend(f32x4::ONE, f32x4::ZERO)
+}
+
+#[inline]
+fn round_pixel_channels(values: f32x4) -> Rgba {
+    round_channels(values)
+        .trunc_int()
+        .to_array()
+        .map(|value| value as u8)
+}
 
 impl Img {
     pub fn new(w: u32, h: u32, color: Rgba) -> Self {
@@ -193,7 +216,7 @@ impl Img {
             let y1 = (y0 + 1).min(h as usize - 1);
             let fy = sy - y0 as f32;
             for (x, &(x0, x1, fx)) in columns.iter().enumerate() {
-                let mut acc = [0.0_f32; 4];
+                let mut acc = wide::f32x4::ZERO;
                 for (row, wy) in [(y0, 1.0 - fy), (y1, fy)] {
                     for (col, wx) in [(x0, 1.0 - fx), (x1, fx)] {
                         let weight = wy * wx;
@@ -201,15 +224,13 @@ impl Img {
                             continue;
                         }
                         let pixel = &self.data[(row * w as usize + col) * 4..][..4];
-                        for channel in 0..4 {
-                            acc[channel] += pixel[channel] as f32 * weight;
-                        }
+                        acc +=
+                            wide::f32x4::new(std::array::from_fn(|channel| pixel[channel] as f32))
+                                * wide::f32x4::splat(weight);
                     }
                 }
                 let base = (y as usize * nw as usize + x) * 4;
-                for (channel, value) in acc.iter().enumerate() {
-                    out.data[base + channel] = value.round().clamp(0.0, 255.0) as u8;
-                }
+                out.data[base..base + 4].copy_from_slice(&round_pixel_channels(acc));
             }
         }
         out
@@ -483,6 +504,49 @@ impl Img {
     /// 绘制近似 1px 的覆盖线，类似 PIL draw.line width=w 且不带连接点。
     pub fn draw_line(&mut self, x0: f64, y0: f64, x1: f64, y1: f64, width: f64, color: Rgba) {
         self.stroke_polyline(&[(x0, y0), (x1, y1)], width, color, false);
+    }
+
+    /// 以 src-over 混合绘制单段抗锯齿粗线。
+    ///
+    /// [`Self::draw_line`] 按 PIL 语义覆盖像素，只适合画在空图层上；HUD 叠加层
+    /// 画在已经合成好的画面上，半透明元素必须混合才不会抹掉底下的物件。
+    pub fn blend_line(&mut self, x0: f64, y0: f64, x1: f64, y1: f64, width: f64, color: Rgba) {
+        if width <= 0.0 || color[3] == 0 {
+            return;
+        }
+        let half = width / 2.0;
+        let xa = (x0.min(x1) - half - 1.0).floor().max(0.0) as i64;
+        let ya = (y0.min(y1) - half - 1.0).floor().max(0.0) as i64;
+        let xb = (x0.max(x1) + half + 1.0).ceil().min(self.w as f64 - 1.0) as i64;
+        let yb = (y0.max(y1) + half + 1.0).ceil().min(self.h as f64 - 1.0) as i64;
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let length_sq = dx * dx + dy * dy;
+        for y in ya..=yb {
+            for x in xa..=xb {
+                let px = x as f64 + 0.5;
+                let py = y as f64 + 0.5;
+                let t = if length_sq <= 1e-12 {
+                    0.0
+                } else {
+                    (((px - x0) * dx + (py - y0) * dy) / length_sq).clamp(0.0, 1.0)
+                };
+                let distance = ((px - (x0 + t * dx)).powi(2) + (py - (y0 + t * dy)).powi(2)).sqrt();
+                let coverage = (half - distance + 0.5).clamp(0.0, 1.0);
+                if coverage > 0.0 {
+                    self.blend_px(
+                        x,
+                        y,
+                        [
+                            color[0],
+                            color[1],
+                            color[2],
+                            (f64::from(color[3]) * coverage).round() as u8,
+                        ],
+                    );
+                }
+            }
+        }
     }
 
     /// 绘制带可选圆角连接/端帽的粗折线（PIL joint="curve" + 端部椭圆）。

@@ -13,6 +13,8 @@ pub mod hitsound;
 pub mod model;
 pub mod processing;
 pub mod render;
+#[cfg(feature = "replay")]
+pub mod replay;
 pub mod storyboard;
 pub mod support;
 

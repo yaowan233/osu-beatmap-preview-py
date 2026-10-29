@@ -63,7 +63,6 @@ Combo1:30,120,220
                 "catch": {
                     "gif": {
                         "structure": {"ROW_COUNT": 1, "IMAGES_PER_ROW": 1},
-                        "style": {"SHOW_TIME_LABEL": False},
                     }
                 }
             },
@@ -122,5 +121,6 @@ def test_catch_gif_default_hyperdash_outline_is_red(
     with Image.open(result["preview-img"]) as image:
         colors = image.convert("RGB").getcolors(image.width * image.height)
     assert colors is not None
-    red_pixels = sum(count for count, (r, g, b) in colors if r >= 250 and g <= 5 and b <= 5)
+    # GIF 调色板量化允许少量误差，同时排除暗色背景和其他 Combo 颜色。
+    red_pixels = sum(count for count, (r, g, b) in colors if r >= 240 and g <= 10 and b <= 10)
     assert red_pixels >= 20, sorted(colors, reverse=True)[:12]

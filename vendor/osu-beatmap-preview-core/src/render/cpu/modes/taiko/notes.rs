@@ -1,8 +1,13 @@
 //! 太鼓行背景与 note 的程序化绘制（classic-2013 风格，无图片资源）。
 
+use super::constants::{
+    DRUM_PANEL_BACKGROUND_COLOR, DRUM_PANEL_CENTER_LINE_COLOR, DRUM_PANEL_FACE_COLOR,
+    DRUM_PANEL_OUTLINE_COLOR,
+};
 use crate::domain::parser::round_half_even;
 use crate::render::canvas::Img;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // ─── 工具 ───
 
@@ -18,9 +23,9 @@ fn pyround(v: f64) -> i64 {
 pub struct RenderCache {
     swells: HashMap<(i64, [u8; 4]), Img>,
     animation_swells: HashMap<(i64, [u8; 4], i64, bool), Img>,
-    discs: HashMap<([u8; 3], i64, i64, bool), Img>,
-    tails: HashMap<([u8; 3], i64), Img>,
-    drum_roll_ticks: HashMap<(i64, u8), Img>,
+    discs: HashMap<([u8; 3], i64, i64, bool), Arc<Img>>,
+    tails: HashMap<([u8; 3], i64), Arc<Img>>,
+    drum_roll_ticks: HashMap<(i64, u8), Arc<Img>>,
 }
 
 // ─── 行背景（程序化，替代原 taiko-bar-left/right 图片） ───
@@ -40,7 +45,7 @@ pub fn draw_drum_panel(
         return;
     }
     // 底色：深色面板
-    image.fill_rect_size(x, y, w, h, [30, 30, 30, 255]);
+    image.fill_rect_size(x, y, w, h, DRUM_PANEL_BACKGROUND_COLOR);
     // 左右红色饰条（约占面板宽度的 12%）
     let stripe = ((w as f64 * 0.12) as i64).max(2);
     image.fill_rect_size(x, y, stripe, h, accent_color);
@@ -49,8 +54,13 @@ pub fn draw_drum_panel(
     let cx = x as f64 + w as f64 / 2.0;
     let cy = y as f64 + h as f64 / 2.0;
     let r = (h.min(w) as f64) * 0.36;
-    image.fill_circle_aa(cx, cy, r + (1.5 * detail_scale).max(0.5), [20, 20, 20, 255]);
-    image.fill_circle_aa(cx, cy, r, [248, 238, 220, 255]);
+    image.fill_circle_aa(
+        cx,
+        cy,
+        r + (1.5 * detail_scale).max(0.5),
+        DRUM_PANEL_OUTLINE_COLOR,
+    );
+    image.fill_circle_aa(cx, cy, r, DRUM_PANEL_FACE_COLOR);
     // 鼓面中线（左右手分界）
     let center_line_width = crate::render::geometry::scale_stroke_px(2.0, detail_scale);
     image.fill_rect_size(
@@ -58,7 +68,7 @@ pub fn draw_drum_panel(
         pyround(cy - r),
         center_line_width,
         pyround(2.0 * r).max(1),
-        [180, 165, 135, 255],
+        DRUM_PANEL_CENTER_LINE_COLOR,
     );
 }
 
@@ -193,10 +203,20 @@ pub fn cached_note_disc(
     edge_width: i64,
     swell_marker: bool,
 ) -> &Img {
+    cached_note_disc_arc(cache, color, diameter, edge_width, swell_marker)
+}
+
+pub fn cached_note_disc_arc(
+    cache: &mut RenderCache,
+    color: [u8; 3],
+    diameter: i64,
+    edge_width: i64,
+    swell_marker: bool,
+) -> &Arc<Img> {
     cache
         .discs
         .entry((color, diameter, edge_width, swell_marker))
-        .or_insert_with(|| build_note_disc(color, diameter, edge_width, swell_marker))
+        .or_insert_with(|| Arc::new(build_note_disc(color, diameter, edge_width, swell_marker)))
 }
 
 pub fn build_roll_tail_sprite(color: [u8; 3], height: i64) -> Img {
@@ -222,10 +242,14 @@ pub fn build_roll_tail_sprite(color: [u8; 3], height: i64) -> Img {
 }
 
 pub fn cached_roll_tail(cache: &mut RenderCache, color: [u8; 3], height: i64) -> &Img {
+    cached_roll_tail_arc(cache, color, height)
+}
+
+pub fn cached_roll_tail_arc(cache: &mut RenderCache, color: [u8; 3], height: i64) -> &Arc<Img> {
     cache
         .tails
         .entry((color, height))
-        .or_insert_with(|| build_roll_tail_sprite(color, height))
+        .or_insert_with(|| Arc::new(build_roll_tail_sprite(color, height)))
 }
 
 /// 构造白色实心菱形连打点，并通过高分辨率光栅化保留小尺寸边缘。
@@ -259,11 +283,20 @@ pub fn build_drum_roll_tick_sprite(diameter: i64, alpha: f64) -> Img {
 }
 
 pub fn cached_drum_roll_tick(cache: &mut RenderCache, diameter: i64, alpha: f64) -> &Img {
+    cached_drum_roll_tick_arc(cache, diameter, alpha)
+}
+
+pub fn cached_drum_roll_tick_arc(cache: &mut RenderCache, diameter: i64, alpha: f64) -> &Arc<Img> {
     let alpha_byte = pyround(alpha.clamp(0.0, 1.0) * 255.0).clamp(0, 255) as u8;
     cache
         .drum_roll_ticks
         .entry((diameter.max(1), alpha_byte))
-        .or_insert_with(|| build_drum_roll_tick_sprite(diameter, alpha_byte as f64 / 255.0))
+        .or_insert_with(|| {
+            Arc::new(build_drum_roll_tick_sprite(
+                diameter,
+                alpha_byte as f64 / 255.0,
+            ))
+        })
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1,0 +1,2 @@
+# 回放按原始谱面字节校验 MD5，禁止 checkout 改写 fixture 换行。
+vendor/osu-beatmap-preview-core/assets/test-fixtures/*.osu -text

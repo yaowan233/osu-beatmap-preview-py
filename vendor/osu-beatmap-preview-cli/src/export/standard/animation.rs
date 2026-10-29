@@ -1,8 +1,10 @@
 //! osu!standard GIF 渲染器：2×2 分段预览或单画面片段。
 
+use osu_beatmap_preview_core::render::cpu::modes::standard::constants as standard_constants;
+
 use crate::export::canvas::Img;
 use crate::export::text::format_mmssmmm;
-use crate::media::image::save_animated_gif_streamed;
+use crate::media::image::save_animated_gif_streamed_with_colors;
 use osu_beatmap_preview_core::model::mods::ModSettings;
 use osu_beatmap_preview_core::model::Beatmap;
 use osu_beatmap_preview_core::processing::timeline::{GifRenderOptions, TimeAxis};
@@ -24,35 +26,31 @@ pub(crate) fn render_standard_gif(
     deadline: &RequestDeadline,
 ) -> Result<()> {
     deadline.check()?;
-    match options {
-        GifRenderOptions::Segments {
-            times_ms,
-            duration_seconds,
-            time_axis,
-        } => render_standard_segment_gif(
-            beatmap,
-            mods,
-            times_ms,
-            duration_seconds,
-            time_axis,
-            output_path,
-            fps,
-            deadline,
-        ),
-    }
+    let (times_ms, duration_seconds, time_axis) = options.into_parts();
+    render_standard_segment_gif(
+        beatmap,
+        mods,
+        times_ms,
+        duration_seconds,
+        time_axis,
+        output_path,
+        fps,
+        deadline,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn render_standard_segment_gif(
     beatmap: &Beatmap,
     mods: Option<&ModSettings>,
-    times_ms: Option<Vec<i64>>,
+    times_ms: osu_beatmap_preview_core::processing::timeline::PreviewTimeSelection,
     duration_seconds: Option<f64>,
     time_axis: TimeAxis,
     output_path: &Path,
     fps: Option<u32>,
     deadline: &RequestDeadline,
 ) -> Result<()> {
+    let standard_gif_sizing = standard_constants::gif::sizing();
     let hit_objects = standard_objects(beatmap)?;
     let hit_objects = apply_standard_object_mods(hit_objects, mods);
     let context = build_render_context(
@@ -128,12 +126,7 @@ fn render_standard_segment_gif(
         let mut canvas = Img::new(
             canvas_w as u32,
             canvas_h as u32,
-            crate::config::current()
-                .render
-                .standard
-                .gif
-                .style
-                .CANVAS_BACKGROUND_COLOR,
+            standard_constants::gif::style::CANVAS_BACKGROUND_COLOR,
         );
         for (segment_index, row_timing) in row_timings.iter().enumerate() {
             let (x, y) = gif_frame_origin(segment_index);
@@ -161,73 +154,26 @@ fn render_standard_segment_gif(
                     time_axis.to_display(row_timing.start_time + gameplay_segment_duration)
                 )
             );
-            if crate::config::current()
-                .render
-                .standard
-                .gif
-                .style
-                .SHOW_TIME_LABEL
-            {
+            if standard_constants::gif::style::SHOW_TIME_LABEL {
                 draw_time_label(
                     &mut canvas,
                     &label,
                     x,
-                    y + context.frame_layout.frame_height
-                        + crate::config::current()
-                            .render
-                            .standard
-                            .gif
-                            .sizing
-                            .TIME_LABEL_TOP_GAP,
+                    y + context.frame_layout.frame_height + standard_gif_sizing.TIME_LABEL_TOP_GAP,
                     note,
                     context.frame_layout.frame_width,
-                    crate::config::current()
-                        .render
-                        .standard
-                        .gif
-                        .sizing
-                        .TIME_LABEL_FONT_SIZE,
-                    crate::config::current()
-                        .render
-                        .standard
-                        .gif
-                        .sizing
-                        .TIME_LABEL_NOTE_FONT_SIZE,
-                    crate::config::current()
-                        .render
-                        .standard
-                        .gif
-                        .sizing
-                        .TIME_LABEL_NOTE_TOP_GAP,
+                    standard_gif_sizing.TIME_LABEL_FONT_SIZE,
+                    standard_gif_sizing.TIME_LABEL_NOTE_FONT_SIZE,
+                    standard_gif_sizing.TIME_LABEL_NOTE_TOP_GAP,
                     if row_timing.is_preview {
-                        crate::config::current()
-                            .render
-                            .standard
-                            .gif
-                            .style
-                            .PREVIEW_TIME_LABEL_COLOR
+                        standard_constants::gif::style::PREVIEW_TIME_LABEL_COLOR
                     } else {
-                        crate::config::current()
-                            .render
-                            .standard
-                            .gif
-                            .style
-                            .TIME_LABEL_COLOR
+                        standard_constants::gif::style::TIME_LABEL_COLOR
                     },
                     if row_timing.is_preview {
-                        crate::config::current()
-                            .render
-                            .standard
-                            .gif
-                            .style
-                            .PREVIEW_TIME_LABEL_COLOR
+                        standard_constants::gif::style::PREVIEW_TIME_LABEL_COLOR
                     } else {
-                        crate::config::current()
-                            .render
-                            .standard
-                            .gif
-                            .style
-                            .TIME_LABEL_NOTE_COLOR
+                        standard_constants::gif::style::TIME_LABEL_NOTE_COLOR
                     },
                 );
             }
@@ -235,5 +181,22 @@ fn render_standard_segment_gif(
         canvas
     };
 
-    save_animated_gif_streamed(frame_count, render, output_path, fps, deadline)
+    let label_colors = super::super::gif_time_label_colors(
+        standard_constants::gif::style::SHOW_TIME_LABEL,
+        standard_constants::gif::style::CANVAS_BACKGROUND_COLOR,
+        [
+            standard_constants::gif::style::PREVIEW_TIME_LABEL_COLOR,
+            standard_constants::gif::style::TIME_LABEL_COLOR,
+            standard_constants::gif::style::TIME_LABEL_NOTE_COLOR,
+        ],
+    );
+    save_animated_gif_streamed_with_colors(
+        frame_count,
+        render,
+        output_path,
+        fps,
+        deadline,
+        &label_colors,
+        false,
+    )
 }

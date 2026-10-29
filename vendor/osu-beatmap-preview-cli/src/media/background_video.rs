@@ -4,7 +4,7 @@
 //! - 视频时间 = 谱面时间 − `Video` 事件偏移（[`BackgroundVideo::start_ms`]）；
 //! - 取「显示时间不晚于目标」的最新帧；
 //! - 静态背景图在最底、视频叠在其上，两者用同一 `BACKGROUND_DIM` 暗化；
-//! - 开始处 [`FADE_MS`] 淡入、结束前 [`FADE_MS`] 淡出，窗口外回退背景图。
+//! - 开始处 500ms 淡入、结束前 500ms 淡出，窗口外回退背景图。
 //!
 //! ## 性能：为什么分段并行
 //!
@@ -32,9 +32,7 @@ use rayon::prelude::*;
 use crate::export::canvas::Img;
 
 use super::video::{prepare_video_background, VideoStyle};
-
-/// osu! 的淡入淡出时长（`DrawableStoryboardVideo` 的 `FadeIn(500)` / `FadeOut(500)`）。
-pub const FADE_MS: i64 = 500;
+use osu_beatmap_preview_core::render::canvas::BLACK_OPAQUE;
 
 /// 并行解码的内存预算：一批里所有段的选中画面之和不超过它。
 const MEMORY_BUDGET_BYTES: usize = 768 * 1024 * 1024;
@@ -460,16 +458,7 @@ impl BackgroundVideo {
     }
 }
 
-/// 视频自身时间轴 `video_ms` 处的可见度；开始处 [`FADE_MS`] 淡入、结束前
-/// [`FADE_MS`] 淡出，窗口外为 0（短视频短于两段淡入淡出时取两者更低值）。
-pub(crate) fn visibility_alpha(video_ms: i64, duration_ms: i64) -> f64 {
-    if video_ms < 0 || video_ms >= duration_ms.max(1) {
-        return 0.0;
-    }
-    let fade_in = video_ms as f64 / FADE_MS as f64;
-    let fade_out = (duration_ms - video_ms) as f64 / FADE_MS as f64;
-    fade_in.min(fade_out).clamp(0.0, 1.0)
-}
+pub(crate) use osu_beatmap_preview_core::render::timing::video_visibility_alpha as visibility_alpha;
 
 /// 背景视频容器：解封装按容器分派，两种之外暂不支持（调用方回退背景图）。
 enum VideoContainer {
@@ -581,7 +570,6 @@ pub(crate) struct FrameBackgrounds {
     video: Option<BackgroundVideo>,
     width: u32,
     height: u32,
-    style: VideoStyle,
 }
 
 impl FrameBackgrounds {
@@ -602,7 +590,6 @@ impl FrameBackgrounds {
             video,
             width,
             height,
-            style,
         }
     }
 
@@ -622,9 +609,10 @@ impl FrameBackgrounds {
             return Some(frame);
         }
         // 淡入淡出窗口：与底层背景图（没有则纯色）按 alpha 线性混合。
-        let base = self.static_background.clone().unwrap_or_else(|| {
-            Arc::new(Img::new(self.width, self.height, self.style.black_opaque))
-        });
+        let base = self
+            .static_background
+            .clone()
+            .unwrap_or_else(|| Arc::new(Img::new(self.width, self.height, BLACK_OPAQUE)));
         Some(Arc::new(blend_background(&base, &frame, alpha)))
     }
 }
@@ -720,8 +708,6 @@ mod tests {
             label_color: [255, 255, 255, 255],
             label_font_size: 18,
             label_pad: 16,
-            black_opaque: [0, 0, 0, 255],
-            fallback_background: [0, 0, 0, 255],
         }
     }
 

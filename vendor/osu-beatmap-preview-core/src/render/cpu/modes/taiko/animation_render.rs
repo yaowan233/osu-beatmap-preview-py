@@ -1,15 +1,16 @@
-//! osu!taiko GIF 渲染器：多段预览或单画面片段。
+//! osu!taiko GIF 宫格预览与 GIF、视频共用的单画面动画绘制。
+
+use crate::render::cpu::modes::taiko::constants as taiko_constants;
 
 use crate::domain::errors::{PreviewError, Result};
 use crate::domain::models::{Beatmap, TaikoHitObject, TimingPoint};
 use crate::domain::mods::ModSettings;
 use crate::domain::parser::round_half_even;
-use crate::domain::shared::time_selection::{
-    GifRenderOptions, PreviewSegmentTiming, PreviewTimeSelector,
-};
+use crate::domain::shared::time_selection::{GifRenderOptions, PreviewSegmentTiming};
 use crate::domain::timeout::RequestDeadline;
 use crate::render::canvas::Img;
 use crate::render::cpu::AnimationFrames;
+use crate::render::shared::draw::OverlayCanvas;
 use crate::render::text::{draw_text, text_size};
 use crate::render::visibility::{Flashlight, FlashlightKind, VisibilityTimeline};
 use std::cell::RefCell;
@@ -21,10 +22,33 @@ use super::animation::{
 };
 use super::constants::*;
 use super::notes::{
-    cached_drum_roll_tick, cached_note_disc, cached_roll_tail, draw_drum_panel,
-    draw_track_background, paste_clipped, RenderCache,
+    cached_drum_roll_tick_arc, cached_note_disc_arc, cached_roll_tail_arc, draw_drum_panel,
+    draw_track_background, RenderCache,
 };
 use super::timing::*;
+
+pub(crate) trait TaikoReplayHitResult: Copy {
+    fn is_hit(self) -> bool;
+}
+
+impl TaikoReplayHitResult for bool {
+    fn is_hit(self) -> bool {
+        self
+    }
+}
+
+#[cfg(feature = "replay")]
+impl TaikoReplayHitResult for crate::gameplay::events::HitResult {
+    fn is_hit(self) -> bool {
+        crate::gameplay::events::HitResult::is_hit(self)
+    }
+}
+
+pub(crate) struct TaikoReplayDrawState<'a, T> {
+    pub head: Option<(f64, T)>,
+    pub end: Option<(f64, T)>,
+    pub nodes: &'a [Option<(f64, T)>],
+}
 
 #[inline]
 pub fn pyround(v: f64) -> i64 {
@@ -91,9 +115,8 @@ pub struct AnimationLayout {
     pub playfield_left: i64,
     pub first_row_top: i64,
     pub row_stride: i64,
-    pub row_content_height: i64,
     pub render_scale: f64,
-    /// 第 0 行的内容框（多行 GIF 布局只用于文档与断言；MP4 只有一行）。
+    /// 轨道内容框；GIF 每格和 MP4 都使用独立的完整画布。
     /// 视频物件层的帧就是最终画布，底色只填这块区域，物件允许溢出到画布边缘。
     pub content: crate::render::geometry::PixelRect,
     pub track_background_color: [u8; 4],
@@ -114,27 +137,22 @@ pub fn prepare_taiko_gif_frames(
     deadline: &RequestDeadline,
 ) -> Result<AnimationFrames> {
     deadline.check()?;
-    match options {
-        GifRenderOptions::Segments {
-            times_ms,
-            duration_seconds,
-            time_axis,
-        } => prepare_taiko_segment_gif_frames(
-            beatmap,
-            mods,
-            times_ms,
-            duration_seconds,
-            time_axis,
-            fps,
-            deadline,
-        ),
-    }
+    let (times_ms, duration_seconds, time_axis) = options.into_parts();
+    prepare_taiko_segment_gif_frames(
+        beatmap,
+        mods,
+        times_ms,
+        duration_seconds,
+        time_axis,
+        fps,
+        deadline,
+    )
 }
 
 fn prepare_taiko_segment_gif_frames(
     beatmap: &Beatmap,
     mods: Option<&ModSettings>,
-    times_ms: Option<Vec<i64>>,
+    times_ms: crate::domain::shared::time_selection::PreviewTimeSelection,
     duration_seconds: Option<f64>,
     time_axis: crate::domain::shared::time_selection::TimeAxis,
     fps: Option<u32>,
@@ -159,19 +177,19 @@ fn prepare_taiko_segment_gif_frames(
         .iter()
         .map(|h| (h.start_time, h.end_time))
         .collect();
-    let segment_timings: Vec<PreviewSegmentTiming> = PreviewTimeSelector::new(
-        beatmap,
-        spans,
-        crate::config::current()
-            .render
-            .taiko
-            .gif
-            .structure
-            .ROW_COUNT as usize,
-        gameplay_segment_duration,
-        times_ms,
-    )?
-    .choose()?;
+    let config = crate::config::current();
+    let structure = &config.render.taiko.gif.structure;
+    let segment_count = structure
+        .ROW_COUNT
+        .checked_mul(structure.IMAGES_PER_ROW)
+        .filter(|&count| {
+            count > 0
+                && structure.ROW_COUNT <= u16::MAX as usize
+                && structure.IMAGES_PER_ROW <= u16::MAX as usize
+        })
+        .ok_or_else(|| PreviewError::render("太鼓 GIF 网格行列数必须为正数且不能溢出"))?;
+    let segment_timings: Vec<PreviewSegmentTiming> =
+        times_ms.choose(beatmap, spans, segment_count, gameplay_segment_duration)?;
 
     let slider_multiplier = effective_slider_multiplier(beatmap, mods)?;
     let timing_points = effective_timing_points(beatmap, mods);
@@ -205,7 +223,20 @@ fn prepare_taiko_segment_gif_frames(
     // DT/HT 已作用于谱面时钟；滚动窗口保持谱面时间单位，避免倍率重复生效。
     let time_range = compute_time_range();
 
-    let layout = build_animation_layout(time_range);
+    let layout =
+        build_video_animation_layout(time_range, crate::render::geometry::OutputFormat::Gif);
+    let (canvas_width, canvas_height) = gif_canvas_size(&layout);
+    if canvas_width <= 0
+        || canvas_height <= 0
+        || canvas_width > u16::MAX as i64
+        || canvas_height > u16::MAX as i64
+    {
+        return Err(PreviewError::render("太鼓 GIF 画布尺寸超出格式范围"));
+    }
+    let origins: Vec<_> = (0..segment_timings.len())
+        .map(|index| gif_frame_origin(index, &layout))
+        .collect();
+    let autoplay = super::autoplay::Autoplay::new(&prepared_hit_objects, &layout);
     let frame_count = pyround(segment_duration_ms * fps / 1000.0).max(1) as usize;
 
     let segment_snapshot_times: Vec<Vec<i64>> = segment_timings
@@ -227,80 +258,70 @@ fn prepare_taiko_segment_gif_frames(
         static TAIKO_GIF_CACHE: RefCell<RenderCache> = RefCell::new(RenderCache::default());
     }
 
-    // 预渲染静态行背景（鼓面板、轨道和判定圆）一次，再逐帧克隆，
-    // 避免在 150 帧中重复绘制 600 次。
-    let static_bg = {
-        let mut bg = Img::new(
-            layout.image_width as u32,
-            layout.image_height as u32,
-            crate::config::current()
-                .render
-                .taiko
-                .gif
-                .style
-                .IMAGE_BACKGROUND,
-        );
-        for segment_index in 0..segment_timings.len() {
-            draw_row_background(&mut bg, &layout, segment_index as i64);
-        }
-        bg
-    };
+    // 每格先在完整画布内绘制，再拼入宫格，转盘和 FL 不会影响相邻片段或时间标签。
+    let mut static_bg = Img::new(
+        layout.image_width as u32,
+        layout.image_height as u32,
+        taiko_constants::gif::style::IMAGE_BACKGROUND,
+    );
+    draw_row_background(&mut static_bg, &layout, 0);
 
     let render = move |frame_index: usize| -> Img {
-        let mut canvas = static_bg.clone();
-
-        debug_assert_eq!(segment_timings.len(), segment_snapshot_times.len());
-        for (segment_index, snapshot_times) in segment_snapshot_times
+        let mut canvas = Img::new(
+            canvas_width as u32,
+            canvas_height as u32,
+            taiko_constants::gif::style::IMAGE_BACKGROUND,
+        );
+        for (segment_index, (timing, snapshot_times)) in segment_timings
             .iter()
+            .zip(&segment_snapshot_times)
             .enumerate()
-            .take(segment_timings.len())
         {
             let snapshot_time = snapshot_times[frame_index];
+            let mut frame = static_bg.clone();
             TAIKO_GIF_CACHE.with(|cache| {
                 draw_hit_objects(
-                    &mut canvas,
+                    &mut frame,
                     &prepared_hit_objects,
                     &prepared_measure_lines,
                     &layout,
-                    segment_index as i64,
+                    0,
                     snapshot_time,
                     &mut cache.borrow_mut(),
-                )
+                );
+                autoplay.draw(
+                    &mut frame,
+                    &layout,
+                    0,
+                    snapshot_time,
+                    &mut cache.borrow_mut(),
+                );
             });
             if let Some(timeline) = &flashlight {
-                taiko_flashlight(timeline, snapshot_time, &layout, segment_index as i64).apply(
-                    &mut canvas,
+                taiko_flashlight(timeline, snapshot_time, &layout, 0).apply(
+                    &mut frame,
                     crate::render::geometry::PixelRect {
-                        // 音符允许溢出轨道；遮罩必须覆盖整行宽度，包含页面边距。
                         x: 0,
-                        y: gif_row_top(segment_index as i64, &layout),
+                        y: 0,
                         width: layout.image_width,
-                        height: layout.row_height,
+                        height: layout.image_height,
                     },
                 );
             }
-        }
-
-        for (segment_index, segment_timing) in segment_timings.iter().enumerate() {
-            if crate::config::current()
-                .render
-                .taiko
-                .gif
-                .style
-                .SHOW_TIME_LABEL
-            {
+            let (x, y) = origins[segment_index];
+            canvas.alpha_composite(&frame, x, y);
+            if taiko_constants::gif::style::SHOW_TIME_LABEL {
                 draw_time_label(
                     &mut canvas,
-                    segment_timing.start_time,
+                    timing.start_time,
                     gameplay_segment_duration,
-                    segment_index as i64,
+                    (x, y),
                     &layout,
-                    segment_timing.is_preview,
+                    timing.is_preview,
                     time_axis,
                 );
             }
         }
-
         canvas
     };
 
@@ -494,29 +515,61 @@ pub fn prepare_measure_lines(
 
 // ─── 布局 ───
 
-pub fn build_animation_layout(time_range: f64) -> AnimationLayout {
-    build_animation_layout_with_segments_and_format(
-        time_range,
-        crate::config::current()
-            .render
-            .taiko
-            .gif
-            .structure
-            .ROW_COUNT as usize,
-        crate::render::geometry::OutputFormat::Gif,
+fn gif_unit_size(layout: &AnimationLayout) -> (i64, i64) {
+    let sizing = taiko_constants::gif::sizing();
+    let info_bottom = if taiko_constants::gif::style::SHOW_TIME_LABEL {
+        sizing.INFO_MARGIN_BOTTOM
+    } else {
+        0
+    };
+    (
+        sizing.INFO_MARGIN_LEFT + layout.image_width + sizing.INFO_MARGIN_RIGHT,
+        sizing.INFO_MARGIN_TOP + layout.image_height + info_bottom,
     )
 }
 
-pub fn build_animation_layout_with_segments_and_format(
+pub fn gif_canvas_size(layout: &AnimationLayout) -> (i64, i64) {
+    let config = crate::config::current();
+    let structure = &config.render.taiko.gif.structure;
+    let sizing = taiko_constants::gif::sizing();
+    let (unit_width, unit_height) = gif_unit_size(layout);
+    (
+        sizing.PAGE_MARGIN_LEFT
+            + sizing.PAGE_MARGIN_RIGHT
+            + structure.IMAGES_PER_ROW as i64 * unit_width
+            + (structure.IMAGES_PER_ROW as i64 - 1) * sizing.GRID_GAP,
+        sizing.PAGE_MARGIN_TOP
+            + sizing.PAGE_MARGIN_BOTTOM
+            + structure.ROW_COUNT as i64 * unit_height
+            + (structure.ROW_COUNT as i64 - 1) * sizing.GRID_GAP,
+    )
+}
+
+pub fn gif_frame_origin(index: usize, layout: &AnimationLayout) -> (i64, i64) {
+    let columns = crate::config::current()
+        .render
+        .taiko
+        .gif
+        .structure
+        .IMAGES_PER_ROW;
+    let sizing = taiko_constants::gif::sizing();
+    let (unit_width, unit_height) = gif_unit_size(layout);
+    (
+        sizing.PAGE_MARGIN_LEFT
+            + sizing.INFO_MARGIN_LEFT
+            + (index % columns) as i64 * (unit_width + sizing.GRID_GAP),
+        sizing.PAGE_MARGIN_TOP
+            + sizing.INFO_MARGIN_TOP
+            + (index / columns) as i64 * (unit_height + sizing.GRID_GAP),
+    )
+}
+
+pub fn build_animation_layout_with_format(
     time_range: f64,
-    segment_count: usize,
     output_format: crate::render::geometry::OutputFormat,
 ) -> AnimationLayout {
     let geometry = crate::render::geometry::taiko_geometry(output_format);
-    let render_scale = crate::render::geometry::output_scale(
-        crate::render::geometry::GameMode::Taiko,
-        output_format,
-    );
+    let render_scale = crate::render::geometry::taiko_playfield_scale(output_format);
     let row_height = geometry.playfield.height;
     let left_panel_width = pyround(
         row_height as f64 * crate::render::cpu::modes::taiko::constants::DRUM_PANEL_WIDTH_RATIO,
@@ -529,31 +582,7 @@ pub fn build_animation_layout_with_segments_and_format(
     let segment_width = (right_panel_width - inner_padding * 2).max(1);
 
     let (image_width, image_height, playfield_left, first_row_top, row_stride) =
-        if output_format == crate::render::geometry::OutputFormat::Gif {
-            let config = &crate::config::current().render.taiko.gif;
-            let unit_width = config.sizing.INFO_MARGIN_LEFT
-                + geometry.content.width
-                + config.sizing.INFO_MARGIN_RIGHT;
-            // 时间标签关闭时，底部信息区不参与行高度和行间步进。
-            let info_bottom = if config.style.SHOW_TIME_LABEL {
-                config.sizing.INFO_MARGIN_BOTTOM
-            } else {
-                0
-            };
-            let unit_height = config.sizing.INFO_MARGIN_TOP + row_height + info_bottom;
-            (
-                config.sizing.PAGE_MARGIN_LEFT + unit_width + config.sizing.PAGE_MARGIN_RIGHT,
-                config.sizing.PAGE_MARGIN_TOP
-                    + segment_count as i64 * unit_height
-                    + (segment_count as i64 - 1) * config.sizing.ROW_GAP
-                    + config.sizing.PAGE_MARGIN_BOTTOM,
-                config.sizing.PAGE_MARGIN_LEFT + config.sizing.INFO_MARGIN_LEFT,
-                config.sizing.PAGE_MARGIN_TOP + config.sizing.INFO_MARGIN_TOP,
-                unit_height + config.sizing.ROW_GAP,
-            )
-        } else {
-            (geometry.content.width, row_height, 0, 0, row_height)
-        };
+        (geometry.content.width, row_height, 0, 0, row_height);
 
     let normal_note_diameter = pyround(
         row_height as f64 * crate::render::cpu::modes::taiko::constants::NORMAL_NOTE_SIZE_RATIO,
@@ -563,24 +592,18 @@ pub fn build_animation_layout_with_segments_and_format(
     );
     let (track_background_color, track_edge_color, track_accent_color, judgement_line_color) =
         match output_format {
-            crate::render::geometry::OutputFormat::Gif => {
-                let config = &crate::config::current().render.taiko.gif;
-                (
-                    config.style.TRACK_BACKGROUND_COLOR,
-                    config.style.TRACK_EDGE_COLOR,
-                    config.style.TRACK_ACCENT_COLOR,
-                    config.style.JUDGEMENT_LINE_COLOR,
-                )
-            }
-            crate::render::geometry::OutputFormat::Mp4 => {
-                let config = &crate::config::current().render.taiko.mp4;
-                (
-                    config.style.TRACK_BACKGROUND_COLOR,
-                    config.style.TRACK_EDGE_COLOR,
-                    config.style.TRACK_ACCENT_COLOR,
-                    config.style.JUDGEMENT_LINE_COLOR,
-                )
-            }
+            crate::render::geometry::OutputFormat::Gif => (
+                taiko_constants::gif::style::TRACK_BACKGROUND_COLOR,
+                taiko_constants::gif::style::TRACK_EDGE_COLOR,
+                taiko_constants::gif::style::TRACK_ACCENT_COLOR,
+                taiko_constants::gif::style::JUDGEMENT_LINE_COLOR,
+            ),
+            crate::render::geometry::OutputFormat::Mp4 => (
+                taiko_constants::mp4::style::TRACK_BACKGROUND_COLOR,
+                taiko_constants::mp4::style::TRACK_EDGE_COLOR,
+                taiko_constants::mp4::style::TRACK_ACCENT_COLOR,
+                taiko_constants::mp4::style::JUDGEMENT_LINE_COLOR,
+            ),
             crate::render::geometry::OutputFormat::Png => unreachable!("PNG 不使用动画布局"),
         };
 
@@ -597,7 +620,6 @@ pub fn build_animation_layout_with_segments_and_format(
         playfield_left,
         first_row_top,
         row_stride,
-        row_content_height: row_height,
         render_scale,
         content: crate::render::geometry::PixelRect {
             x: playfield_left,
@@ -613,25 +635,38 @@ pub fn build_animation_layout_with_segments_and_format(
     }
 }
 
-/// MP4 物件层布局：帧尺寸 = 视频画布，单行内容带按 [`video_canvas`] 居中。
-///
-/// 物件层与最终画布同尺寸后，音符只会在视频边界被裁剪，不会再被内容框切掉一半；
-/// 行高、鼓面板与音符尺寸完全沿用内容框布局，因此分辨率与物件大小都不变。
+/// 完整动画画布：GIF 使用宫格单帧尺寸，实时预览与 MP4 使用视频尺寸。
+/// 轨道按游戏的相对高度定位，物件只在完整画布边界裁剪。
 pub fn build_video_animation_layout(
     time_range: f64,
     output_format: crate::render::geometry::OutputFormat,
 ) -> AnimationLayout {
-    let layout = build_animation_layout_with_segments_and_format(time_range, 1, output_format);
+    let layout = build_animation_layout_with_format(time_range, output_format);
     let geometry = crate::render::geometry::taiko_geometry(output_format);
-    let canvas = crate::render::geometry::video_canvas(geometry.content);
+    let canvas = if output_format == crate::render::geometry::OutputFormat::Gif {
+        let (width, height) =
+            crate::render::geometry::preview_frame_size(crate::render::geometry::output_scale(
+                crate::render::geometry::GameMode::Taiko,
+                output_format,
+            ));
+        crate::render::geometry::VideoCanvas {
+            width: width as u32,
+            height: height as u32,
+            origin_x: 0,
+            origin_y: 0,
+        }
+    } else {
+        crate::render::geometry::video_canvas(geometry.content)
+    };
+    let top = crate::render::geometry::taiko_playfield_top(canvas.height);
     AnimationLayout {
         image_width: canvas.width as i64,
         image_height: canvas.height as i64,
         playfield_left: layout.playfield_left + canvas.origin_x,
-        first_row_top: layout.first_row_top + canvas.origin_y,
+        first_row_top: layout.first_row_top + top,
         content: crate::render::geometry::PixelRect {
             x: canvas.origin_x,
-            y: canvas.origin_y,
+            y: top,
             width: geometry.content.width,
             height: layout.row_height,
         },
@@ -835,8 +870,43 @@ pub(crate) fn draw_hit_object(
     snapshot_time: i64,
     cache: &mut RenderCache,
 ) {
+    draw_hit_object_state::<bool>(
+        image,
+        hit_object,
+        layout,
+        row_index,
+        snapshot_time,
+        cache,
+        None,
+    );
+}
+
+pub(crate) fn draw_hit_object_state<T: TaikoReplayHitResult>(
+    target: &mut impl OverlayCanvas,
+    hit_object: &PreparedTaikoHitObject,
+    layout: &AnimationLayout,
+    row_index: i64,
+    snapshot_time: i64,
+    cache: &mut RenderCache,
+    replay_state: Option<&TaikoReplayDrawState<'_, T>>,
+) {
     let base = &hit_object.hit_object;
-    if hit_object.hidden && base.hit_type & (SWELL_FLAG | DRUMROLL_FLAG) != 0 {
+    if base.hit_type & DRUMROLL_FLAG != 0 {
+        let ended = snapshot_time >= base.end_time;
+        if (ended && (replay_state.is_none() || snapshot_time - base.end_time >= 100))
+            || (!ended
+                && can_skip(
+                    hit_object,
+                    snapshot_time,
+                    layout,
+                    judgement_line_x(layout),
+                    layout.playfield_left + layout.left_panel_width + layout.right_panel_width,
+                ))
+        {
+            return;
+        }
+    }
+    if hit_object.hidden && base.hit_type & DRUMROLL_FLAG != 0 {
         let alpha = hidden_alpha(
             base.start_time as f64,
             snapshot_time,
@@ -847,28 +917,104 @@ pub(crate) fn draw_hit_object(
             return;
         }
         // 整条物件先合成再淡出，避免头尾重叠处因重复混合而出现亮斑。
-        let mut layer = Img::new(image.w, image.h, [0, 0, 0, 0]);
+        let (width, height) = target.dimensions();
         let mut visible = hit_object.clone();
         visible.hidden = false;
-        draw_hit_object(
+        let mut layer = Img::new(width, height, [0; 4]);
+        draw_hit_object_state(
             &mut layer,
             &visible,
             layout,
             row_index,
             snapshot_time,
             cache,
+            replay_state,
         );
-        image.alpha_composite_scaled(&layer, 0, 0, alpha);
+        target.sprite_opacity(&std::sync::Arc::new(layer), 0, 0, alpha);
         return;
     }
     if base.hit_type & SWELL_FLAG != 0 {
-        draw_swell_object(image, hit_object, layout, row_index, snapshot_time, cache);
+        let progress = replay_state.map(|state| {
+            let completed = state
+                .nodes
+                .iter()
+                .flatten()
+                .filter(|(time, result)| *time <= snapshot_time as f64 && result.is_hit())
+                .count() as u32;
+            let finished = state.end.map_or(f64::INFINITY, |judgement| judgement.0);
+            (completed, finished)
+        });
+        let completed_at = progress.map_or_else(
+            || swell_hit_progress(base, hit_object.swell_required_hits, snapshot_time).1,
+            |(_, finished)| finished,
+        );
+        if snapshot_time as f64 > completed_at + SWELL_CLEAR_MS {
+            return;
+        }
+        let right_bound =
+            layout.playfield_left + layout.left_panel_width + layout.right_panel_width;
+        let x = object_x(
+            base.start_time as f64,
+            snapshot_time as f64,
+            hit_object.start_multiplier,
+            layout,
+        );
+        if x - layout.big_note_diameter / 2 > right_bound {
+            return;
+        }
+        let alpha = if hit_object.hidden {
+            hidden_alpha(
+                base.start_time as f64,
+                snapshot_time,
+                hit_object.start_multiplier,
+                layout.time_range,
+            )
+        } else {
+            1.0
+        };
+        if alpha <= 0.0 {
+            return;
+        }
+        let (center_x, center_y, diameter) =
+            swell_frame_geometry(hit_object, layout, row_index, snapshot_time);
+        let (width, height) = target.dimensions();
+        let padding = crate::render::geometry::scale_stroke_px(3.0, layout.render_scale);
+        // 局部原点取偶数，保持 round-half-even 在半像素边界的奇偶性。
+        let left = ((center_x - diameter as f64 / 2.0).floor() as i64 - padding)
+            .max(0)
+            .div_euclid(2)
+            * 2;
+        let top = ((center_y - diameter as f64 / 2.0).floor() as i64 - padding)
+            .max(0)
+            .div_euclid(2)
+            * 2;
+        let right =
+            ((center_x + diameter as f64 / 2.0).ceil() as i64 + padding).min(i64::from(width));
+        let bottom =
+            ((center_y + diameter as f64 / 2.0).ceil() as i64 + padding).min(i64::from(height));
+        if right <= left || bottom <= top {
+            return;
+        }
+        let mut local_layout = layout.clone();
+        local_layout.playfield_left -= left;
+        local_layout.first_row_top -= top;
+        let mut layer = Img::new((right - left) as u32, (bottom - top) as u32, [0; 4]);
+        draw_swell_object_with_progress(
+            &mut layer,
+            hit_object,
+            &local_layout,
+            row_index,
+            snapshot_time,
+            cache,
+            progress,
+        );
+        target.sprite_opacity(&std::sync::Arc::new(layer), left, top, alpha);
         return;
     }
     if base.hit_type & DRUMROLL_FLAG != 0 {
         let is_big_roll = base.hitsound & HIT_SOUNDS_STRONG != 0;
-        draw_span_object(
-            image,
+        draw_span_object_state(
+            target,
             hit_object,
             layout,
             row_index,
@@ -877,13 +1023,22 @@ pub(crate) fn draw_hit_object(
             is_big_roll,
             crate::render::cpu::modes::taiko::constants::ROLL_COLOR,
             false,
+            replay_state,
         );
         return;
     }
-    draw_circle_object(image, hit_object, layout, row_index, snapshot_time, cache);
+    draw_circle_object(
+        target,
+        hit_object,
+        layout,
+        row_index,
+        snapshot_time,
+        cache,
+        replay_state,
+    );
 }
 
-/// GIF 转盘放在轨道内，视频转盘沿用经典皮肤在判定点右下方展开的大圆布局。
+/// 动画转盘沿用经典皮肤在判定点右下方展开的大圆布局。
 /// 返回当前帧的圆心与直径，CPU 绘制和 GPU 局部图层必须共用几何边界。
 pub(crate) fn swell_frame_geometry(
     hit_object: &PreparedTaikoHitObject,
@@ -894,22 +1049,11 @@ pub(crate) fn swell_frame_geometry(
     let base = &hit_object.hit_object;
     let judgement_x = judgement_line_x(layout) as f64;
     let row_center_y = gif_row_center_y(row_index, layout) as f64;
-    let (max_diameter, target_x, target_y) = match layout.output_format {
-        crate::render::geometry::OutputFormat::Gif => {
-            let diameter = (layout.row_height as f64 * 0.88).round().max(1.0);
-            (diameter, judgement_x + diameter / 2.0, row_center_y)
-        }
-        crate::render::geometry::OutputFormat::Mp4 => {
-            // 经典素材以 128px 音符为基准，当前音符尺寸已应用 MP4 的 SCALE。
-            let scale = layout.normal_note_diameter as f64 / 128.0;
-            (
-                666.0 * 0.8 * scale,
-                judgement_x + 250.0 * scale,
-                row_center_y + 100.0 * scale,
-            )
-        }
-        crate::render::geometry::OutputFormat::Png => unreachable!("PNG 不使用动画转盘"),
-    };
+    // 经典素材以 128px 音符为基准，当前音符尺寸已应用对应输出格式的 SCALE。
+    let scale = layout.normal_note_diameter as f64 / 128.0;
+    let max_diameter = 666.0 * 0.8 * scale;
+    let target_x = judgement_x + 250.0 * scale;
+    let target_y = row_center_y + 100.0 * scale;
     let warning_x = object_x(
         base.start_time as f64,
         snapshot_time as f64,
@@ -932,26 +1076,26 @@ pub(crate) fn swell_frame_geometry(
     )
 }
 
-/// 转盘在当前输出格式对应的位置展开，附加信息随圆心移动。
-fn draw_swell_object(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_swell_object_with_progress(
     image: &mut Img,
     hit_object: &PreparedTaikoHitObject,
     layout: &AnimationLayout,
     row_index: i64,
     snapshot_time: i64,
     cache: &mut RenderCache,
+    progress: Option<(u32, f64)>,
 ) {
     let base = &hit_object.hit_object;
     let elapsed = (snapshot_time - base.start_time) as f64;
-    let (completed, completed_at) =
-        swell_hit_progress(base, hit_object.swell_required_hits, snapshot_time);
+    let (completed, completed_at) = progress
+        .unwrap_or_else(|| swell_hit_progress(base, hit_object.swell_required_hits, snapshot_time));
     let clear_elapsed = snapshot_time as f64 - completed_at;
     if clear_elapsed > SWELL_CLEAR_MS {
         return;
     }
     let (center_x, center_y, diameter) =
         swell_frame_geometry(hit_object, layout, row_index, snapshot_time);
-    let runtime = crate::config::current();
     let (
         color,
         text_color,
@@ -964,31 +1108,31 @@ fn draw_swell_object(
         show_marker,
     ) = match layout.output_format {
         crate::render::geometry::OutputFormat::Gif => {
-            let config = &runtime.render.taiko.gif;
+            let sizing = taiko_constants::gif::sizing();
             (
-                config.style.SWELL_COLOR,
-                config.style.SWELL_TEXT_COLOR,
-                config.sizing.SWELL_HIT_COUNT_FONT_SIZE,
-                config.sizing.SWELL_CLEAR_FONT_SIZE,
-                config.style.SHOW_SWELL_HIT_COUNT,
-                config.style.SHOW_SWELL_APPROACH_CIRCLE,
-                config.style.SHOW_SWELL_CLEAR,
-                config.style.SWELL_RING_THICKNESS_RATIO,
-                config.style.SHOW_SWELL_MARKER,
+                taiko_constants::gif::style::SWELL_COLOR,
+                taiko_constants::gif::style::SWELL_TEXT_COLOR,
+                sizing.SWELL_HIT_COUNT_FONT_SIZE,
+                sizing.SWELL_CLEAR_FONT_SIZE,
+                taiko_constants::gif::style::SHOW_SWELL_HIT_COUNT,
+                taiko_constants::gif::style::SHOW_SWELL_APPROACH_CIRCLE,
+                taiko_constants::gif::style::SHOW_SWELL_CLEAR,
+                taiko_constants::gif::style::SWELL_RING_THICKNESS_RATIO,
+                taiko_constants::gif::style::SHOW_SWELL_MARKER,
             )
         }
         crate::render::geometry::OutputFormat::Mp4 => {
-            let config = &runtime.render.taiko.mp4;
+            let sizing = taiko_constants::mp4::sizing();
             (
-                config.style.SWELL_COLOR,
-                config.style.SWELL_TEXT_COLOR,
-                config.sizing.SWELL_HIT_COUNT_FONT_SIZE,
-                config.sizing.SWELL_CLEAR_FONT_SIZE,
-                config.style.SHOW_SWELL_HIT_COUNT,
-                config.style.SHOW_SWELL_APPROACH_CIRCLE,
-                config.style.SHOW_SWELL_CLEAR,
-                config.style.SWELL_RING_THICKNESS_RATIO,
-                config.style.SHOW_SWELL_MARKER,
+                taiko_constants::mp4::style::SWELL_COLOR,
+                taiko_constants::mp4::style::SWELL_TEXT_COLOR,
+                sizing.SWELL_HIT_COUNT_FONT_SIZE,
+                sizing.SWELL_CLEAR_FONT_SIZE,
+                taiko_constants::mp4::style::SHOW_SWELL_HIT_COUNT,
+                taiko_constants::mp4::style::SHOW_SWELL_APPROACH_CIRCLE,
+                taiko_constants::mp4::style::SHOW_SWELL_CLEAR,
+                taiko_constants::mp4::style::SWELL_RING_THICKNESS_RATIO,
+                taiko_constants::mp4::style::SHOW_SWELL_MARKER,
             )
         }
         crate::render::geometry::OutputFormat::Png => unreachable!("PNG 不使用动画转盘"),
@@ -1022,7 +1166,12 @@ fn draw_swell_object(
         if !show_clear {
             return;
         }
-        "CLEAR".to_owned()
+        if completed >= hit_object.swell_required_hits {
+            "CLEAR"
+        } else {
+            "MISS"
+        }
+        .to_owned()
     } else {
         if !show_hits {
             return;
@@ -1063,13 +1212,14 @@ fn draw_swell_object(
     );
 }
 
-fn draw_circle_object(
-    image: &mut Img,
+fn draw_circle_object<T: TaikoReplayHitResult>(
+    target: &mut impl OverlayCanvas,
     hit_object: &PreparedTaikoHitObject,
     layout: &AnimationLayout,
     row_index: i64,
     snapshot_time: i64,
     cache: &mut RenderCache,
+    replay_state: Option<&TaikoReplayDrawState<'_, T>>,
 ) {
     let base = &hit_object.hit_object;
     let center_x = object_x(
@@ -1082,7 +1232,14 @@ fn draw_circle_object(
 
     let judgement_x = judgement_line_x(layout);
     let right_bound = layout.playfield_left + layout.left_panel_width + layout.right_panel_width;
-    if center_x < judgement_x || center_x > right_bound {
+    if (replay_state.is_none() && center_x < judgement_x) || center_x > right_bound {
+        return;
+    }
+
+    let judged = replay_state
+        .and_then(|state| state.head)
+        .filter(|(time, _)| *time <= snapshot_time as f64);
+    if judged.is_some_and(|(_, result)| result.is_hit()) {
         return;
     }
 
@@ -1099,7 +1256,7 @@ fn draw_circle_object(
         crate::render::cpu::modes::taiko::constants::CENTRE_NOTE_COLOR
     };
 
-    let alpha = if hit_object.hidden {
+    let mut alpha = if hit_object.hidden {
         hidden_alpha(
             base.start_time as f64,
             snapshot_time,
@@ -1109,15 +1266,18 @@ fn draw_circle_object(
     } else {
         1.0
     };
+    if let Some((judged_at, _)) = judged {
+        alpha *= (1.0 - (snapshot_time as f64 - judged_at) / 100.0).clamp(0.0, 1.0);
+    }
     if alpha > 0.0 {
-        let sprite = cached_note_disc(
+        let sprite = cached_note_disc_arc(
             cache,
             color,
             diameter,
             crate::render::geometry::scale_stroke_px(1.0, layout.render_scale),
             false,
         );
-        image.alpha_composite_scaled(
+        target.sprite_opacity(
             sprite,
             pyround(center_x as f64 - diameter as f64 / 2.0),
             pyround(center_y as f64 - diameter as f64 / 2.0),
@@ -1127,6 +1287,7 @@ fn draw_circle_object(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn draw_span_object(
     image: &mut Img,
     hit_object: &PreparedTaikoHitObject,
@@ -1138,9 +1299,114 @@ fn draw_span_object(
     span_color: [u8; 3],
     draw_swell_marker: bool,
 ) {
+    draw_span_object_state::<bool>(
+        image,
+        hit_object,
+        layout,
+        row_index,
+        snapshot_time,
+        cache,
+        use_large_geometry,
+        span_color,
+        draw_swell_marker,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_span_object_state<T: TaikoReplayHitResult>(
+    target: &mut impl OverlayCanvas,
+    hit_object: &PreparedTaikoHitObject,
+    layout: &AnimationLayout,
+    row_index: i64,
+    snapshot_time: i64,
+    cache: &mut RenderCache,
+    use_large_geometry: bool,
+    span_color: [u8; 3],
+    draw_swell_marker: bool,
+    replay_state: Option<&TaikoReplayDrawState<'_, T>>,
+) {
+    let end_time = hit_object.hit_object.end_time;
+    if replay_state.is_some() && snapshot_time >= end_time {
+        let alpha = (1.0 - (snapshot_time - end_time) as f64 / 100.0).clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            return;
+        }
+        let (width, height) = target.dimensions();
+        let diameter = if use_large_geometry {
+            layout.big_note_diameter
+        } else {
+            layout.normal_note_diameter
+        };
+        let center_x = judgement_line_x(layout);
+        let center_y = gif_row_center_y(row_index, layout);
+        let padding = crate::render::geometry::scale_stroke_px(2.0, layout.render_scale);
+        let left = (center_x - diameter / 2 - padding).max(0).div_euclid(2) * 2;
+        let top = (center_y - diameter / 2 - padding).max(0).div_euclid(2) * 2;
+        let tail_width = pyround(diameter as f64 * SPAN_BODY_HEIGHT_RATIO / 2.0).max(1);
+        let right = (center_x + diameter / 2 + tail_width + padding).min(i64::from(width));
+        let bottom = (center_y + diameter / 2 + padding).min(i64::from(height));
+        if right <= left || bottom <= top {
+            return;
+        }
+        let mut local_layout = layout.clone();
+        local_layout.playfield_left -= left;
+        local_layout.first_row_top -= top;
+        local_layout.image_width = right - left;
+        local_layout.image_height = bottom - top;
+        let mut layer = Img::new(
+            local_layout.image_width as u32,
+            local_layout.image_height as u32,
+            [0; 4],
+        );
+        draw_span_object_inner(
+            &mut layer,
+            hit_object,
+            &local_layout,
+            row_index,
+            snapshot_time,
+            cache,
+            use_large_geometry,
+            span_color,
+            draw_swell_marker,
+            replay_state,
+            true,
+        );
+        target.sprite_opacity(&std::sync::Arc::new(layer), left, top, alpha);
+    } else {
+        draw_span_object_inner(
+            target,
+            hit_object,
+            layout,
+            row_index,
+            snapshot_time,
+            cache,
+            use_large_geometry,
+            span_color,
+            draw_swell_marker,
+            replay_state,
+            false,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_span_object_inner<T: TaikoReplayHitResult>(
+    target: &mut impl OverlayCanvas,
+    hit_object: &PreparedTaikoHitObject,
+    layout: &AnimationLayout,
+    row_index: i64,
+    snapshot_time: i64,
+    cache: &mut RenderCache,
+    use_large_geometry: bool,
+    span_color: [u8; 3],
+    draw_swell_marker: bool,
+    replay_state: Option<&TaikoReplayDrawState<'_, T>>,
+    draw_after_end: bool,
+) {
     let base = &hit_object.hit_object;
     // 只有尾巴随时间缩短；到结束时整条物件（包括圆头）一次性消失。
-    if snapshot_time >= base.end_time {
+    if snapshot_time >= base.end_time && !draw_after_end {
         return;
     }
     let start_x = object_x(
@@ -1173,7 +1439,7 @@ fn draw_span_object(
     let body_height = pyround(head_diameter as f64 * body_ratio);
 
     draw_roll_body(
-        image,
+        target,
         span_color,
         start_x,
         end_x,
@@ -1183,7 +1449,7 @@ fn draw_span_object(
         clip_right,
     );
     draw_span_tail(
-        image,
+        target,
         span_color,
         end_x,
         center_y,
@@ -1196,7 +1462,7 @@ fn draw_span_object(
         // 尾端 tick 必须位于尾部半圆上方，否则交界处会被覆盖一半；
         // 头部最后绘制，仍保持 osu! 中头部遮挡首个 tick 的层级。
         draw_drum_roll_ticks(
-            image,
+            target,
             &hit_object.drum_roll_ticks,
             layout,
             snapshot_time,
@@ -1205,10 +1471,11 @@ fn draw_span_object(
             clip_left,
             clip_right,
             hit_object.hidden,
+            replay_state.map(|state| state.nodes),
         );
     }
     draw_span_head(
-        image,
+        target,
         span_color,
         start_x,
         center_y,
@@ -1223,8 +1490,8 @@ fn draw_span_object(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_drum_roll_ticks(
-    image: &mut Img,
+fn draw_drum_roll_ticks<T: TaikoReplayHitResult>(
+    target: &mut impl OverlayCanvas,
     ticks: &[PreparedAnimationPoint],
     layout: &AnimationLayout,
     snapshot_time: i64,
@@ -1233,12 +1500,26 @@ fn draw_drum_roll_ticks(
     clip_left: i64,
     clip_right: i64,
     hidden: bool,
+    replay_nodes: Option<&[Option<(f64, T)>]>,
 ) {
     let base_diameter =
         pyround(layout.normal_note_diameter as f64 * DRUM_ROLL_TICK_DIAMETER_RATIO).max(1);
 
-    for tick in ticks {
-        let (mut alpha, scale) = drum_roll_tick_transform(tick.time, snapshot_time);
+    for (index, tick) in ticks.iter().enumerate() {
+        let judged = replay_nodes
+            .and_then(|nodes| nodes.get(index))
+            .copied()
+            .flatten()
+            .filter(|(time, _)| *time <= snapshot_time as f64);
+        let (mut alpha, scale) = match judged {
+            Some((time, result)) if result.is_hit() => {
+                drum_roll_tick_transform(time, snapshot_time)
+            }
+            Some(_) => (0.0, 1.0),
+            // 回放只在实际击中时播放节点动画；普通预览仍按节点时间自动触发。
+            None if replay_nodes.is_some() => (1.0, 1.0),
+            None => drum_roll_tick_transform(tick.time, snapshot_time),
+        };
         if hidden {
             alpha *= hidden_alpha(tick.time, snapshot_time, tick.multiplier, layout.time_range);
         }
@@ -1253,14 +1534,14 @@ fn draw_drum_roll_ticks(
             continue;
         }
         let y = center_y - diameter / 2;
-        let sprite = cached_drum_roll_tick(cache, diameter, alpha);
-        paste_clipped(image, sprite, x, y, clip_left, clip_right);
+        let sprite = cached_drum_roll_tick_arc(cache, diameter, alpha);
+        target.sprite_clipped(sprite, x, y, clip_left, clip_right, 1.0);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn draw_roll_body(
-    image: &mut Img,
+    target: &mut impl OverlayCanvas,
     color: [u8; 3],
     start_x: i64,
     end_x: i64,
@@ -1278,7 +1559,7 @@ fn draw_roll_body(
         return;
     }
     let y0 = pyround(center_y as f64 - height as f64 / 2.0);
-    image.fill_rect_size(
+    target.fill_rect_size(
         visible_left,
         y0,
         visible_right - visible_left,
@@ -1289,7 +1570,7 @@ fn draw_roll_body(
 
 #[allow(clippy::too_many_arguments)]
 fn draw_span_head(
-    image: &mut Img,
+    target: &mut impl OverlayCanvas,
     color: [u8; 3],
     center_x: i64,
     center_y: i64,
@@ -1302,13 +1583,13 @@ fn draw_span_head(
 ) {
     let sprite_x = pyround(center_x as f64 - diameter as f64 / 2.0);
     let sprite_y = pyround(center_y as f64 - diameter as f64 / 2.0);
-    let disc = cached_note_disc(cache, color, diameter, edge_width, draw_swell_marker);
-    paste_clipped(image, disc, sprite_x, sprite_y, clip_left, clip_right);
+    let disc = cached_note_disc_arc(cache, color, diameter, edge_width, draw_swell_marker);
+    target.sprite_clipped(disc, sprite_x, sprite_y, clip_left, clip_right, 1.0);
 }
 
 #[allow(clippy::too_many_arguments)]
 fn draw_span_tail(
-    image: &mut Img,
+    target: &mut impl OverlayCanvas,
     color: [u8; 3],
     join_x: i64,
     center_y: i64,
@@ -1318,123 +1599,50 @@ fn draw_span_tail(
     clip_right: i64,
 ) {
     let y = pyround(center_y as f64 - height as f64 / 2.0);
-    let tail = cached_roll_tail(cache, color, height);
-    paste_clipped(image, tail, join_x, y, clip_left, clip_right);
+    let tail = cached_roll_tail_arc(cache, color, height);
+    target.sprite_clipped(tail, join_x, y, clip_left, clip_right, 1.0);
 }
 
-fn draw_time_label(
+pub fn draw_time_label(
     image: &mut Img,
     start_time: i64,
     duration_ms: i64,
-    row_index: i64,
+    frame_origin: (i64, i64),
     layout: &AnimationLayout,
     is_preview: bool,
     time_axis: crate::domain::shared::time_selection::TimeAxis,
 ) {
-    let text_gap = crate::render::geometry::scale_px(
-        5.0,
-        crate::render::geometry::output_scale(
-            crate::render::geometry::GameMode::Taiko,
-            crate::render::geometry::OutputFormat::Gif,
-        ),
-    );
-    let y = gif_row_top(row_index, layout) + layout.row_content_height + text_gap;
+    let taiko_gif_sizing = taiko_constants::gif::sizing();
+    let (frame_x, frame_y) = frame_origin;
+    let y = frame_y + layout.image_height + taiko_gif_sizing.TIME_LABEL_TOP_GAP;
     let label = format!(
         "{} - {}",
-        crate::render::text::format_mmss_floor(time_axis.to_display(start_time)),
-        crate::render::text::format_mmss_floor(time_axis.to_display(start_time + duration_ms))
+        crate::render::text::format_mmssmmm(time_axis.to_display(start_time)),
+        crate::render::text::format_mmssmmm(time_axis.to_display(start_time + duration_ms))
     );
     let color = if is_preview {
-        crate::config::current()
-            .render
-            .taiko
-            .gif
-            .style
-            .PREVIEW_TIME_LABEL_COLOR
+        taiko_constants::gif::style::PREVIEW_TIME_LABEL_COLOR
     } else {
-        crate::config::current()
-            .render
-            .taiko
-            .gif
-            .style
-            .TIME_LABEL_COLOR
+        taiko_constants::gif::style::TIME_LABEL_COLOR
     };
     let note_color = if is_preview {
-        crate::config::current()
-            .render
-            .taiko
-            .gif
-            .style
-            .PREVIEW_TIME_LABEL_COLOR
+        taiko_constants::gif::style::PREVIEW_TIME_LABEL_COLOR
     } else {
-        crate::config::current()
-            .render
-            .taiko
-            .gif
-            .style
-            .TIME_LABEL_NOTE_COLOR
+        taiko_constants::gif::style::TIME_LABEL_NOTE_COLOR
     };
-    let (label_w, label_h) = text_size(
-        &label,
-        crate::config::current()
-            .render
-            .taiko
-            .gif
-            .sizing
-            .TIME_LABEL_FONT_SIZE,
-    );
-    let x = (layout.playfield_left as f64
-        + (layout.image_width - layout.playfield_left * 2 - label_w as i64) as f64 / 2.0)
-        .floor() as i64;
-    draw_text(
+    crate::render::text::draw_time_label(
         image,
-        x,
-        y,
         &label,
-        crate::config::current()
-            .render
-            .taiko
-            .gif
-            .sizing
-            .TIME_LABEL_FONT_SIZE,
+        frame_x,
+        y,
+        is_preview.then_some("Preview Time"),
+        layout.image_width,
+        taiko_gif_sizing.TIME_LABEL_FONT_SIZE,
+        taiko_gif_sizing.TIME_LABEL_NOTE_FONT_SIZE,
+        taiko_gif_sizing.TIME_LABEL_NOTE_TOP_GAP,
         color,
+        note_color,
     );
-
-    if is_preview {
-        let note = "Preview Time";
-        let (note_w, _) = text_size(
-            note,
-            crate::config::current()
-                .render
-                .taiko
-                .gif
-                .sizing
-                .TIME_LABEL_NOTE_FONT_SIZE,
-        );
-        let note_x = (layout.playfield_left as f64
-            + (layout.image_width - layout.playfield_left * 2 - note_w as i64) as f64 / 2.0)
-            .floor() as i64;
-        draw_text(
-            image,
-            note_x,
-            y + label_h as i64
-                + crate::render::geometry::scale_px(
-                    4.0,
-                    crate::render::geometry::output_scale(
-                        crate::render::geometry::GameMode::Taiko,
-                        crate::render::geometry::OutputFormat::Gif,
-                    ),
-                ),
-            note,
-            crate::config::current()
-                .render
-                .taiko
-                .gif
-                .sizing
-                .TIME_LABEL_NOTE_FONT_SIZE,
-            note_color,
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1442,7 +1650,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn video_swell_restores_classic_position_and_fits_the_canvas_at_all_scales() {
+    fn animation_swell_uses_the_same_classic_geometry_for_gif_and_video() {
         for scale in [0.5, 1.0, 1.5, 2.0] {
             let mut config = crate::config::CoreConfig::default();
             config.render.taiko.mp4.SCALE = scale;
@@ -1486,8 +1694,154 @@ mod tests {
                 let mut gif = layout.clone();
                 gif.output_format = crate::render::geometry::OutputFormat::Gif;
                 let (_, gif_y, gif_diameter) = swell_frame_geometry(&objects[0], &gif, 0, 1200);
-                assert_eq!(gif_y, gif_row_center_y(0, &gif) as f64);
-                assert!(gif_diameter <= gif.row_height, "GIF 继续使用行内转盘");
+                assert_eq!(gif_y, y);
+                assert_eq!(gif_diameter, diameter);
+            });
+        }
+    }
+
+    #[test]
+    fn gif_grid_preserves_independent_full_frames_and_format_scales() {
+        use crate::render::geometry::OutputFormat;
+        let beatmap = crate::domain::parser::parse_beatmap_bytes(
+            b"osu file format v14\n[General]\nMode:1\nPreviewTime:1000\n[Difficulty]\nSliderMultiplier:1.4\nSliderTickRate:1\n[TimingPoints]\n0,500,4,1,0,100,1,0\n[HitObjects]\n256,192,1000,8,0,4000,0:0:0:0:\n256,192,1100,1,0,0:0:0:0:\n256,192,5000,1,0,0:0:0:0:\n"
+        ).unwrap();
+        let deadline = RequestDeadline::new(
+            std::time::Instant::now(),
+            "gif",
+            std::time::Duration::from_secs(60),
+        );
+        for (scale, rows, columns) in [(0.5, 1, 1), (0.75, 2, 2), (1.0, 2, 2), (1.25, 2, 3)] {
+            let mut config = crate::config::CoreConfig::default();
+            config.render.standard.gif.SCALE = scale;
+            config.render.standard.gif.structure.ROW_COUNT = rows;
+            config.render.standard.gif.structure.IMAGES_PER_ROW = columns;
+            let (standard_canvas, standard_origins, standard_sizing) =
+                crate::config::with_config(std::sync::Arc::new(config.clone()), || {
+                    use crate::render::cpu::modes::standard::{constants, context};
+                    (
+                        context::gif_canvas_size(),
+                        (0..rows * columns)
+                            .map(context::gif_frame_origin)
+                            .collect::<Vec<_>>(),
+                        constants::gif::sizing(),
+                    )
+                });
+            config.render.standard.gif.SCALE = 2.75;
+            config.render.taiko.gif.SCALE = scale;
+            config.render.taiko.mp4.SCALE = 3.0;
+            config.render.taiko.png.SCALE = 4.0;
+            config.render.taiko.gif.structure.ROW_COUNT = rows;
+            config.render.taiko.gif.structure.IMAGES_PER_ROW = columns;
+            config.render.taiko.gif.style.SHOW_MEASURE_LINES = false;
+            crate::config::with_config(std::sync::Arc::new(config), || {
+                let times: Vec<_> = (0..rows * columns)
+                    .map(|index| 1000 + index as i64 * 100)
+                    .collect();
+                let mods = ModSettings::new();
+                let frames = prepare_taiko_gif_frames(
+                    &beatmap,
+                    Some(&mods),
+                    GifRenderOptions::Segments {
+                        times_ms: Some(times.clone()),
+                        duration_seconds: Some(0.1),
+                        time_axis: crate::domain::shared::time_selection::TimeAxis::new(0),
+                    },
+                    Some(10),
+                    &deadline,
+                )
+                .unwrap();
+                let image = frames.render(0);
+                let layout = build_video_animation_layout(compute_time_range(), OutputFormat::Gif);
+                let sizing = taiko_constants::gif::sizing();
+                let width = sizing.PAGE_MARGIN_LEFT
+                    + sizing.PAGE_MARGIN_RIGHT
+                    + columns as i64 * layout.image_width
+                    + (columns as i64 - 1) * sizing.GRID_GAP;
+                let height = sizing.PAGE_MARGIN_TOP
+                    + sizing.PAGE_MARGIN_BOTTOM
+                    + rows as i64 * (layout.image_height + sizing.INFO_MARGIN_BOTTOM)
+                    + (rows as i64 - 1) * sizing.GRID_GAP;
+                assert_eq!((image.w as i64, image.h as i64), (width, height));
+                assert_eq!((width, height), standard_canvas);
+                let hit_objects = taiko_hit_objects(&beatmap);
+                let objects = prepare_hit_objects(
+                    &hit_objects,
+                    &MultiplierLookup {
+                        points: build_multiplier_points(&beatmap.timing_points, 1.4),
+                    },
+                    &beatmap.timing_points,
+                    1.0,
+                );
+                let autoplay = super::super::autoplay::Autoplay::new(&objects, &layout);
+                for (index, time) in times.into_iter().enumerate() {
+                    let (x, y) = gif_frame_origin(index, &layout);
+                    assert_eq!((x, y), standard_origins[index]);
+                    let mut expected = Img::new(
+                        layout.image_width as u32,
+                        layout.image_height as u32,
+                        taiko_constants::gif::style::IMAGE_BACKGROUND,
+                    );
+                    draw_row_background(&mut expected, &layout, 0);
+                    draw_hit_objects(
+                        &mut expected,
+                        &objects,
+                        &[],
+                        &layout,
+                        0,
+                        time,
+                        &mut RenderCache::default(),
+                    );
+                    autoplay.draw(&mut expected, &layout, 0, time, &mut RenderCache::default());
+                    let actual = image.crop(
+                        x as u32,
+                        y as u32,
+                        (x + layout.image_width) as u32,
+                        (y + layout.image_height) as u32,
+                    );
+                    assert_eq!(
+                        actual.data, expected.data,
+                        "第 {index} 格必须保留独立画布与选段时间"
+                    );
+                    let mut expected_label = Img::new(
+                        layout.image_width as u32,
+                        standard_sizing.INFO_MARGIN_BOTTOM as u32,
+                        taiko_constants::gif::style::IMAGE_BACKGROUND,
+                    );
+                    let label = format!(
+                        "{} - {}",
+                        crate::render::text::format_mmssmmm(time),
+                        crate::render::text::format_mmssmmm(time + 100),
+                    );
+                    let color = if time == 1000 {
+                        taiko_constants::gif::style::PREVIEW_TIME_LABEL_COLOR
+                    } else {
+                        taiko_constants::gif::style::TIME_LABEL_COLOR
+                    };
+                    crate::render::text::draw_time_label(
+                        &mut expected_label,
+                        &label,
+                        0,
+                        standard_sizing.TIME_LABEL_TOP_GAP,
+                        (time == 1000).then_some("Preview Time"),
+                        layout.image_width,
+                        standard_sizing.TIME_LABEL_FONT_SIZE,
+                        standard_sizing.TIME_LABEL_NOTE_FONT_SIZE,
+                        standard_sizing.TIME_LABEL_NOTE_TOP_GAP,
+                        color,
+                        color,
+                    );
+                    let actual_label = image.crop(
+                        x as u32,
+                        (y + layout.image_height) as u32,
+                        (x + layout.image_width) as u32,
+                        (y + layout.image_height + sizing.INFO_MARGIN_BOTTOM) as u32,
+                    );
+                    assert_eq!(
+                        actual_label.data, expected_label.data,
+                        "时间标签的字号、间距和格式必须与 STD 相同"
+                    );
+                }
             });
         }
     }
@@ -1499,16 +1853,15 @@ mod tests {
             left_panel_width: 100,
             right_panel_width: 300,
             image_width: 400,
-            image_height: 100,
+            image_height: 300,
             normal_note_diameter: 48,
             big_note_diameter: 74,
             time_range: 1000.0,
             playfield_left: 0,
-            first_row_top: 0,
-            row_stride: 100,
+            first_row_top: 80,
+            row_stride: 300,
             judgement_line_color: [255, 255, 255, 255],
             output_format: crate::render::geometry::OutputFormat::Gif,
-            row_content_height: 100,
             render_scale: scale,
             content: crate::render::geometry::PixelRect {
                 x: 0,
@@ -1525,12 +1878,14 @@ mod tests {
         layout.left_panel_width = pyround(layout.left_panel_width as f64 * scale);
         layout.right_panel_width = pyround(layout.right_panel_width as f64 * scale);
         layout.image_width = pyround(layout.image_width as f64 * scale);
-        layout.image_height = layout.row_height;
-        layout.row_stride = layout.row_height;
+        layout.image_height = pyround(layout.image_height as f64 * scale);
+        layout.first_row_top = pyround(layout.first_row_top as f64 * scale);
+        layout.row_stride = layout.image_height;
         layout.normal_note_diameter = pyround(layout.normal_note_diameter as f64 * scale);
         layout.big_note_diameter = pyround(layout.big_note_diameter as f64 * scale);
         layout.content.width = layout.image_width;
         layout.content.height = layout.row_height;
+        layout.content.y = layout.first_row_top;
         layout
     }
 
@@ -1569,7 +1924,7 @@ mod tests {
     }
 
     #[test]
-    fn swell_animation_stays_within_the_track_at_all_scales() {
+    fn swell_animation_expands_beyond_the_track_within_each_frame() {
         for scale in [0.5, 1.0, 2.0] {
             let layout = swell_test_layout(scale);
             let objects = prepare_hit_objects(
@@ -1590,12 +1945,18 @@ mod tests {
             for time in (900..2500).step_by(25) {
                 let mut image = Img::new(
                     layout.image_width as u32,
-                    (layout.row_height + 100) as u32,
+                    layout.image_height as u32,
                     [0, 0, 0, 0],
                 );
                 draw_hit_objects(&mut image, &objects, &[], &layout, 0, time, &mut cache);
                 if let Some(bounds) = image.alpha_bbox() {
-                    assert!(bounds.3 <= layout.row_height as u32, "转盘不能侵入下一行");
+                    assert!(bounds.1 > 0 && bounds.3 < layout.image_height as u32);
+                    if time == 1200 {
+                        assert!(
+                            bounds.3 > (layout.first_row_top + layout.row_height) as u32,
+                            "转盘必须能展开到轨道外"
+                        );
+                    }
                 }
             }
         }
@@ -1634,31 +1995,6 @@ mod tests {
     }
 
     #[test]
-    fn swell_details_can_be_disabled_without_changing_the_green_ring() {
-        let mut config = crate::config::CoreConfig::default();
-        config.render.taiko.gif.style.SHOW_SWELL_MARKER = false;
-        config.render.taiko.gif.style.SHOW_SWELL_HIT_COUNT = false;
-        config.render.taiko.gif.style.SHOW_SWELL_APPROACH_CIRCLE = false;
-        config.render.taiko.gif.style.SHOW_SWELL_CLEAR = false;
-        crate::config::with_config(std::sync::Arc::new(config), || {
-            let layout = swell_test_layout(1.0);
-            let image = render_test_swell(1200);
-            let x =
-                pyround(judgement_line_x(&layout) as f64 + layout.row_height as f64 * 0.44) as u32;
-            let y = gif_row_center_y(0, &layout) as u32;
-            assert_eq!(image.get(x, y)[3], 0);
-            assert!(
-                image
-                    .data
-                    .chunks_exact(4)
-                    .filter(|p| p[3] > 0)
-                    .all(|p| p[..3] == SWELL_COLOR),
-                "关闭附加信息后只显示青绿色圆环"
-            );
-        });
-    }
-
-    #[test]
     fn swell_marker_only_appears_before_the_first_hit() {
         for format in [
             crate::render::geometry::OutputFormat::Gif,
@@ -1680,32 +2016,37 @@ mod tests {
                 &[],
                 1.0,
             );
-            let render = |time, marker| {
-                let mut config = crate::config::CoreConfig::default();
-                config.render.taiko.gif.style.SHOW_SWELL_MARKER = marker;
-                config.render.taiko.mp4.style.SHOW_SWELL_MARKER = marker;
-                crate::config::with_config(std::sync::Arc::new(config), || {
-                    let mut image = Img::new(
-                        layout.image_width as u32,
-                        layout.image_height as u32,
-                        [0, 0, 0, 0],
-                    );
-                    draw_hit_object(
-                        &mut image,
-                        &objects[0],
-                        &layout,
-                        0,
-                        time,
-                        &mut RenderCache::default(),
-                    );
-                    image
-                })
+            let render = |time| {
+                let mut image = Img::new(
+                    layout.image_width as u32,
+                    layout.image_height as u32,
+                    [0, 0, 0, 0],
+                );
+                draw_hit_object(
+                    &mut image,
+                    &objects[0],
+                    &layout,
+                    0,
+                    time,
+                    &mut RenderCache::default(),
+                );
+                image
             };
-            let waiting = render(900, true);
-            assert!(
-                waiting.data != render(900, false).data,
-                "击打前必须显示中心标志"
-            );
+            let waiting = render(900);
+            // 中心标志为青绿色小环；击打后的数字和计时圈为白色。
+            let marker_region = |image: &Img, time| {
+                let (cx, cy, diameter) = swell_frame_geometry(&objects[0], &layout, 0, time);
+                (0..image.h)
+                    .flat_map(|y| (0..image.w).map(move |x| (x, y)))
+                    .filter(|&(x, y)| {
+                        (x as f64 - cx).powi(2) + (y as f64 - cy).powi(2)
+                            < (diameter as f64 * 0.3).powi(2)
+                    })
+                    .map(|(x, y)| image.get(x, y))
+                    .filter(|pixel| pixel[3] > 0 && pixel[..3] == SWELL_COLOR)
+                    .count()
+            };
+            assert!(marker_region(&waiting, 900) > 0, "击打前必须显示中心标志");
             assert!(
                 waiting
                     .data
@@ -1716,7 +2057,7 @@ mod tests {
             );
             for time in [1000, 1100, 1200, 1800] {
                 assert!(
-                    render(time, true).data == render(time, false).data,
+                    marker_region(&render(time), time) == 0,
                     "开始击打后必须隐藏中心标志"
                 );
             }
@@ -1726,8 +2067,9 @@ mod tests {
     #[test]
     fn swell_restores_remaining_count_inner_circle_and_clear() {
         let layout = swell_test_layout(1.0);
-        let x = pyround(judgement_line_x(&layout) as f64 + layout.row_height as f64 * 0.44);
-        let y = gif_row_center_y(0, &layout);
+        let classic_scale = layout.normal_note_diameter as f64 / 128.0;
+        let x = pyround(judgement_line_x(&layout) as f64 + 250.0 * classic_scale);
+        let y = pyround(gif_row_center_y(0, &layout) as f64 + 100.0 * classic_scale);
         for (time, label, font) in [(1200, "11", 24), (1800, "CLEAR", 16)] {
             let image = render_test_swell(time);
             let (w, h) = text_size(label, font);
@@ -1739,19 +2081,6 @@ mod tests {
                 "转盘必须显示计数或完成文字"
             );
         }
-        let mut config = crate::config::CoreConfig::default();
-        config.render.taiko.gif.style.SHOW_SWELL_MARKER = false;
-        config.render.taiko.gif.style.SHOW_SWELL_HIT_COUNT = false;
-        config.render.taiko.gif.style.SHOW_SWELL_CLEAR = false;
-        let inner =
-            crate::config::with_config(std::sync::Arc::new(config), || render_test_swell(1200));
-        assert!(
-            inner
-                .data
-                .chunks_exact(4)
-                .any(|p| p[3] > 0 && p[..3] == NOTE_RING_COLOR[..3]),
-            "关闭文字后仍需保留计时内圈"
-        );
     }
 
     #[test]
@@ -1780,8 +2109,6 @@ mod tests {
             &[],
             1.0,
         );
-        let mut sheet = Img::new(800, 420, [15, 15, 15, 255]);
-        let mut sheet_y = 0;
         for scale in [0.5, 1.0, 2.0] {
             let layout = swell_test_layout(scale);
             let render = |time, cache: &mut RenderCache| {
@@ -1797,11 +2124,6 @@ mod tests {
             let first = render(1200, &mut cache);
             let next = render(1050, &mut cache);
             assert_ne!(first.data, next.data, "转盘圆盘和计时圈必须随时间变化");
-            let x = pyround(
-                judgement_line_x(&layout) as f64 + (layout.row_height as f64 * 0.88).round() / 2.0,
-            ) as u32;
-            let y = gif_row_center_y(0, &layout) as u32;
-            assert_eq!(first.get(x + pyround(130.0 * scale) as u32, y)[3], 0);
             assert!(
                 render(1400, &mut cache)
                     .data
@@ -1809,21 +2131,13 @@ mod tests {
                     .any(|pixel| pixel[3] > 0),
                 "末端 SV 不能提前隐藏活动转盘"
             );
-            let mut preview = Img::new(
-                layout.image_width as u32,
-                layout.image_height as u32,
-                [0, 0, 0, 255],
-            );
-            draw_row_background(&mut preview, &layout, 0);
-            draw_hit_objects(&mut preview, &objects, &[], &layout, 0, 1200, &mut cache);
-            sheet.alpha_composite(&preview, 0, sheet_y);
-            sheet_y += layout.image_height + 10;
         }
     }
 
     #[test]
     fn hidden_spans_fade_and_disappear_as_a_whole() {
-        let layout = build_animation_layout(1000.0);
+        let layout =
+            build_video_animation_layout(1000.0, crate::render::geometry::OutputFormat::Gif);
         for hit_type in [DRUMROLL_FLAG, SWELL_FLAG] {
             let mut object = PreparedTaikoHitObject {
                 hit_object: TaikoHitObject {
@@ -1898,7 +2212,6 @@ mod tests {
             playfield_left: 0,
             first_row_top: 0,
             row_stride: 80,
-            row_content_height: 80,
             render_scale: 1.0,
             content: crate::render::geometry::PixelRect {
                 x: 0,
@@ -1972,7 +2285,6 @@ mod tests {
             playfield_left: 0,
             first_row_top: 0,
             row_stride: 80,
-            row_content_height: 80,
             render_scale: 1.0,
             content: crate::render::geometry::PixelRect {
                 x: 0,
@@ -2019,15 +2331,16 @@ mod tests {
     }
 
     #[test]
-    fn video_layout_centers_row_band_without_resizing_notes() {
-        for scale in [1.0_f64, 2.0] {
+    fn video_layout_matches_game_track_position_without_resizing_notes() {
+        for (scale, expected_top) in [(0.75, 81), (1.0, 109), (1.25, 135), (2.0, 216)] {
             let mut custom = crate::config::CoreConfig::default();
             custom.render.taiko.mp4.SCALE = scale;
+            custom.render.taiko.gif.SCALE = 3.0;
+            custom.render.taiko.png.SCALE = 4.0;
             crate::config::with_config(std::sync::Arc::new(custom), || {
                 let time_range = compute_time_range();
-                let content = build_animation_layout_with_segments_and_format(
+                let content = build_animation_layout_with_format(
                     time_range,
-                    1,
                     crate::render::geometry::OutputFormat::Mp4,
                 );
                 let video = build_video_animation_layout(
@@ -2043,11 +2356,11 @@ mod tests {
                     (canvas.width as i64, canvas.height as i64)
                 );
                 assert_eq!(video.content.x, canvas.origin_x);
-                assert_eq!(video.content.y, canvas.origin_y);
+                assert_eq!(video.content.y, expected_top);
                 assert_eq!(video.content.width, geometry.content.width);
                 assert_eq!(video.content.height, content.row_height);
                 assert_eq!(video.playfield_left, canvas.origin_x);
-                assert_eq!(video.first_row_top, canvas.origin_y);
+                assert_eq!(video.first_row_top, expected_top);
                 // 行高与音符直径都不随画布变化。
                 assert_eq!(video.row_height, content.row_height);
                 assert_eq!(video.normal_note_diameter, content.normal_note_diameter);
@@ -2057,15 +2370,17 @@ mod tests {
     }
 
     #[test]
-    fn flashlight_hides_notes_that_overflow_into_page_margins() {
+    fn flashlight_masks_each_grid_cell_without_affecting_labels() {
         let mut config = crate::config::CoreConfig::default();
         config.render.taiko.gif.SCALE = 0.75;
         config.render.taiko.gif.structure.ROW_COUNT = 2;
-        config.render.taiko.gif.sizing.PAGE_MARGIN_RIGHT = 32;
-        config.render.taiko.gif.style.SHOW_TIME_LABEL = false;
+
         config.render.taiko.gif.style.SHOW_MEASURE_LINES = false;
         crate::config::with_config(std::sync::Arc::new(config), || {
-            let layout = build_animation_layout(compute_time_range());
+            let layout = build_video_animation_layout(
+                compute_time_range(),
+                crate::render::geometry::OutputFormat::Gif,
+            );
             let right_bound =
                 layout.playfield_left + layout.left_panel_width + layout.right_panel_width;
             let multiplier = 1.4 * MULTIPLIER_BASE_BEAT_LENGTH / 500.0;
@@ -2088,8 +2403,8 @@ mod tests {
                 prepare_taiko_gif_frames(
                     &beatmap,
                     mods,
-                    GifRenderOptions::Segments {
-                        times_ms: Some(vec![1000, 1020]),
+                    GifRenderOptions::ResolvedSegments {
+                        times_ms: vec![1000, 1020, 1040, 1060],
                         duration_seconds: Some(1.0),
                         time_axis: crate::domain::shared::time_selection::TimeAxis::new(0),
                     },
@@ -2102,14 +2417,47 @@ mod tests {
             let normal = prepare(None);
             let mods = ModSettings {
                 flashlight: true,
-                ..ModSettings::default()
+                ..ModSettings::new()
             };
             let masked = prepare(Some(&mods));
-            for row in 0..2 {
-                let x = (right_bound + 1) as u32;
-                let y = gif_row_center_y(row, &layout) as u32;
-                assert!(normal.get(x, y)[0] > 50, "测试音符必须溢出到边距");
-                assert_eq!(masked.get(x, y), [0, 0, 0, 255], "FL 必须覆盖溢出的音符");
+            for index in 0..4 {
+                let (x, y) = gif_frame_origin(index, &layout);
+                let sizing = taiko_constants::gif::sizing();
+                let labels = |image: &Img| {
+                    image.crop(
+                        x as u32,
+                        (y + layout.image_height) as u32,
+                        (x + layout.image_width) as u32,
+                        (y + layout.image_height + sizing.INFO_MARGIN_BOTTOM) as u32,
+                    )
+                };
+                let normal_labels = labels(&normal);
+                assert!(normal_labels
+                    .data
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[..3] != [0, 0, 0]));
+                let masked_labels = labels(&masked);
+                for (offset, (source, actual)) in normal_labels
+                    .data
+                    .chunks_exact(4)
+                    .zip(masked_labels.data.chunks_exact(4))
+                    .enumerate()
+                {
+                    assert_eq!(
+                        source,
+                        actual,
+                        "格 {index}，标签像素 ({}, {})",
+                        offset % normal_labels.w as usize,
+                        offset / normal_labels.w as usize
+                    );
+                }
+            }
+            for index in 0..2 {
+                let (origin_x, origin_y) = gif_frame_origin(index, &layout);
+                let x = (origin_x + right_bound - 5) as u32;
+                let y = (origin_y + gif_row_center_y(0, &layout)) as u32;
+                assert!(normal.get(x, y)[0] > 50, "测试音符必须出现在轨道右端");
+                assert_eq!(masked.get(x, y), [0, 0, 0, 255], "FL 必须覆盖当前格的音符");
             }
         });
     }
@@ -2123,7 +2471,8 @@ mod tests {
         let mut config = crate::config::CoreConfig::default();
         config.render.taiko.gif.SCALE = 0.5;
         config.render.taiko.gif.structure.ROW_COUNT = 1;
-        config.render.taiko.gif.style.SHOW_TIME_LABEL = false;
+        config.render.taiko.gif.structure.IMAGES_PER_ROW = 1;
+
         config.render.taiko.gif.style.SHOW_MEASURE_LINES = false;
         crate::config::with_config(std::sync::Arc::new(config), || {
             let deadline = RequestDeadline::new(
@@ -2153,6 +2502,22 @@ mod tests {
                     )
                     .unwrap()
                 };
+                let layout = build_video_animation_layout(
+                    compute_time_range(),
+                    crate::render::geometry::OutputFormat::Gif,
+                );
+                // 时间标签显示输出时间，倍速比较只检查相同谱面时间的轨道内容。
+                let (origin_x, origin_y) = gif_frame_origin(0, &layout);
+                let track = |image: Img| {
+                    image
+                        .crop(
+                            origin_x as u32,
+                            (origin_y + layout.first_row_top) as u32,
+                            (origin_x + layout.image_width) as u32,
+                            (origin_y + layout.first_row_top + layout.row_height) as u32,
+                        )
+                        .data
+                };
                 let normal = prepare(base);
                 for (rate, frame_index, normal_index) in [
                     ("DT", 4, 6),
@@ -2163,7 +2528,7 @@ mod tests {
                     let changed = prepare(&format!("{base} {rate}"));
                     assert_eq!(changed.frame_count(), 20);
                     assert!(
-                        changed.render(frame_index).data == normal.render(normal_index).data,
+                        track(changed.render(frame_index)) == track(normal.render(normal_index)),
                         "{base} {rate} 在相同谱面时间不能额外改变音符间距"
                     );
                 }

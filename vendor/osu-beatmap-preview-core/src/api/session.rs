@@ -1,4 +1,483 @@
 //! 实时预览会话。
+mod audio {
+    //! 实时会话音频资源和回放事件桥；音乐、流时钟与画面均使用谱面绝对时间。
+    use super::*;
+
+    impl RealtimeSession {
+        // ── 音频：音乐与打击音同流混音 ──────────────────────────────────────
+        //
+        // 时间、倍速与 seek 由会话时钟统一驱动；宿主只需把 `pull_audio` 的输出送进
+        // 音频设备，并把音频线程的消费位置用 `on_audio_clock` 转发回来。
+
+        /// 设置背景音乐（`None` 表示清除）；与打击音共用同一时间轴，倍速、seek、暂停
+        /// 只有一处位置计算。没有音乐的谱面（单独的 `.osu`）不必调用它。
+        pub fn set_music(&mut self, music: Option<SampleData>) {
+            self.mixer.set_music(music);
+        }
+
+        /// 更新音乐音量百分比（0..=100）。
+        pub fn set_music_volume(&mut self, volume: i32) {
+            self.mixer.set_music_gain(hitsound::volume_gain(volume));
+        }
+
+        /// 打开/关闭打击音；关闭时事件时间轴为空，音乐照常输出。
+        pub fn set_hitsound_enabled(&mut self, enabled: bool) {
+            if self.hitsound_enabled == enabled {
+                return;
+            }
+            self.hitsound_enabled = enabled;
+            self.rebuild_hitsound_timeline();
+        }
+
+        pub fn hitsound_enabled(&self) -> bool {
+            self.hitsound_enabled
+        }
+
+        /// 更新打击音音量百分比（0..=100）。
+        pub fn set_hitsound_volume(&mut self, volume: i32) {
+            self.mixer.set_master_gain(hitsound::volume_gain(volume));
+        }
+
+        /// 当前谱面需要样本库提供的样本名（按优先级排列，含裸名回退）；缺失的样本在混音
+        /// 时按静音处理，宿主只装载拿得到的名字。NC 生效时额外带上 4 个节拍鼓点样本名。
+        pub fn hitsound_required_names(&self) -> Vec<String> {
+            #[cfg(feature = "replay")]
+            let mut names = self.osr.as_ref().map_or_else(
+                || hitsound::referenced_names(&self.beatmap),
+                |r| hitsound::replay::referenced_names(&self.beatmap, &r.prepared, &r.gameplay),
+            );
+            #[cfg(not(feature = "replay"))]
+            let mut names = hitsound::referenced_names(&self.beatmap);
+            if let Some((storyboard, _)) = &self.storyboard {
+                names.extend(storyboard.samples.iter().map(|sample| sample.path.clone()));
+            }
+            if self.settings.nightcore {
+                names.extend(hitsound::NIGHTCORE_SAMPLE_NAMES.map(str::to_string));
+            }
+            let mut seen = std::collections::HashSet::new();
+            names.retain(|name| seen.insert(name.clone()));
+            names
+        }
+
+        /// 故事板音效始终取自谱面包，不受皮肤打击音来源开关影响。
+        pub fn storyboard_sample_names(&self) -> Vec<String> {
+            self.storyboard
+                .as_ref()
+                .map_or_else(Vec::new, |(storyboard, _)| {
+                    storyboard
+                        .samples
+                        .iter()
+                        .map(|sample| sample.path.clone())
+                        .collect()
+                })
+        }
+
+        /// 放入一段已解码的样本 PCM。只放进样本库、不重建时间轴：宿主应把样本全部放完后
+        /// 调用一次 [`RealtimeSession::rebuild_hitsound_timeline`]，否则每个样本都遍历整张谱面。
+        pub fn set_hitsound_sample(
+            &mut self,
+            name: &str,
+            channels: hitsound::Channels,
+            sample_rate: u32,
+            loop_len: usize,
+        ) {
+            let data = SampleData {
+                channels,
+                sample_rate: sample_rate.max(1),
+                loop_len,
+            };
+            self.mixer.library_mut().insert(name, data);
+        }
+
+        /// 用当前样本库重建打击音事件时间轴（样本全部放完后调用一次）。
+        /// 打击音关闭时只留 NC 节拍鼓点（鼓点属于 Mod，不受该开关影响）；
+        /// 重建会清空正在播放的声音，只在装载阶段调用。
+        pub fn rebuild_hitsound_timeline(&mut self) {
+            let mut timeline = if self.hitsound_enabled {
+                #[cfg(feature = "replay")]
+                let timeline = self.osr.as_ref().map_or_else(
+                    || hitsound::build_timeline(&self.beatmap, self.mixer.library()),
+                    |r| {
+                        hitsound::replay::build_timeline(
+                            &self.beatmap,
+                            &r.prepared,
+                            &r.gameplay,
+                            self.mixer.library(),
+                        )
+                    },
+                );
+                #[cfg(not(feature = "replay"))]
+                let timeline = hitsound::build_timeline(&self.beatmap, self.mixer.library());
+                timeline
+            } else {
+                HitsoundTimeline::default()
+            };
+            if self.settings.nightcore {
+                let end_ms = (self.timeline.absolute_start_ms + self.timeline.duration_ms) as f64;
+                timeline.merge(hitsound::nightcore_events(
+                    &self.beatmap,
+                    self.mixer.library(),
+                    end_ms,
+                ));
+            }
+            // 游戏内 gameplay hitsound 不挂在 Mod 的音频调整链上。实时输出会由
+            // AudioWorklet 按总倍速重采样，因此这里反向补偿谱面变速，保留原始音高。
+            timeline.scale_frequencies(1.0 / self.timeline.beatmap_speed);
+            if self.storyboard_enabled {
+                if let Some((storyboard, _)) = &self.storyboard {
+                    let mut samples = storyboard.sample_timeline(self.mixer.library());
+                    let start = self.timeline.absolute_start_ms as f64;
+                    // 游戏允许故事板音效晚启动不足 100ms；开场前 98ms 的 intro.mp3
+                    // 应从样本头开始播放，远早于起点的事件则仍跳过，不能改变预览起点。
+                    for event in &mut samples.events {
+                        if event.start_ms < start && start - event.start_ms < 100.0 {
+                            event.start_ms = start;
+                        }
+                    }
+                    timeline.merge(samples);
+                }
+            }
+            self.mixer.rebuild_timeline_events(timeline);
+            #[cfg(feature = "replay")]
+            if self.osr.is_some() {
+                self.mixer.seek_replay(self.mixer.position_ms());
+            }
+        }
+
+        /// 清空已放入的样本并重建时间轴（保留音乐、音量与开关设置）。
+        ///
+        /// 切 Mod 或转谱后需要的样本集合会变，宿主重新装载即可，不必重建会话。
+        pub fn reset_hitsound_samples(&mut self) {
+            *self.mixer.library_mut() = SampleLibrary::new();
+            self.rebuild_hitsound_timeline();
+            self.mixer.stop_all();
+        }
+
+        pub(super) fn seek_mixer(&mut self, chart_ms: f64) {
+            #[cfg(feature = "replay")]
+            if self.osr.is_some() {
+                self.mixer.seek_replay(chart_ms);
+                return;
+            }
+            self.mixer.seek(chart_ms);
+        }
+    }
+}
+
+#[cfg(feature = "replay")]
+mod osr {
+    //! 回放会话接线；判定仅在载入时编译，时钟、资源和音频流沿用实时会话。
+    use super::*;
+    use crate::render::cpu::modes::standard::osr::font::ArgonFont;
+    use crate::{
+        gameplay::timeline::GameplayTimeline, replay::preparation::PreparedReplay,
+        replay::ReplayDocument,
+    };
+
+    pub(super) struct OsrSessionData {
+        pub prepared: PreparedReplay,
+        pub gameplay: Arc<GameplayTimeline>,
+        font: Option<Arc<ArgonFont>>,
+        config: Arc<config::CoreConfig>,
+    }
+    impl std::fmt::Debug for OsrSessionData {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("OsrSessionData").finish_non_exhaustive()
+        }
+    }
+    impl RealtimeSession {
+        pub fn from_replay_bundle(
+            mut bundle: ResourceBundle,
+            options: RealtimeOptions,
+            document: Arc<ReplayDocument>,
+            font: Option<ArgonFont>,
+        ) -> Result<Self> {
+            if options.convert.is_some() || !options.mods.is_empty() {
+                return Err(PreviewError::new("OSR 回放禁止转谱和用户 Mod"));
+            }
+            let beatmap = bundle
+                .beatmap
+                .as_ref()
+                .ok_or_else(|| PreviewError::new("回放缺少谱面"))?;
+            let prepared = PreparedReplay::prepare(beatmap, &document)?;
+            let gameplay = Arc::new(prepared.compile(document)?);
+            if let PreparedReplay::Taiko(p) = &prepared {
+                bundle.beatmap = Some(p.beatmap.clone());
+            }
+            let mut session = Self::from_bundle(bundle, options)?;
+            let first = prepared.first();
+            let last = prepared.last_end().max(gameplay.settlement_time).ceil() as i64;
+            let speed = prepared.mods().settings.speed_multiplier;
+            session.settings = prepared.mods().settings.clone();
+            session.options.mods = session.settings.tokens.clone();
+            session.timeline =
+                preview_timeline(first, last, session.beatmap.audio_lead_in_ms(), speed);
+            session.clock.set_rate(speed, 0.0);
+            session.mixer.set_music_rate(MusicRate::chart_domain(
+                speed,
+                prepared.mods().music_pitch(),
+            ));
+            session.osr = Some(Arc::new(OsrSessionData {
+                prepared,
+                gameplay,
+                font: font.map(Arc::new),
+                config: Arc::clone(&session.options.core_config),
+            }));
+            session.prepare_replay_source()?;
+            session.seek(0.0, session.timeline.absolute_start_ms as f64);
+            Ok(session)
+        }
+        pub fn replay_timeline(&self) -> Option<&GameplayTimeline> {
+            self.osr.as_ref().map(|r| r.gameplay.as_ref())
+        }
+        pub(super) fn prepare_replay_source(&mut self) -> Result<()> {
+            let osr = self.osr.as_ref().expect("仅 OSR 会话构建回放源");
+            let mut cfg = (*osr.config).clone();
+            let native_height = config::with_config(Arc::clone(&osr.config), || {
+                match &osr.prepared {
+                    PreparedReplay::Standard(_) => crate::render::cpu::modes::standard::osr::replay_layout(
+                    crate::render::geometry::OutputFormat::Mp4,
+                )
+                .frame_height,
+                    PreparedReplay::Taiko(_) => crate::render::cpu::modes::taiko::animation_render::build_video_animation_layout(crate::render::cpu::modes::taiko::animation_render::compute_time_range(),crate::render::geometry::OutputFormat::Mp4).image_height,
+                }
+            });
+            // 分辨率切换重新计算当前格式 SCALE，物件与 HUD 在目标像素尺寸直接绘制。
+            let scale = self.options.render.height as f64 / native_height as f64;
+            match &osr.prepared {
+                PreparedReplay::Standard(_) => cfg.render.standard.mp4.SCALE *= scale,
+                PreparedReplay::Taiko(_) => cfg.render.taiko.mp4.SCALE *= scale,
+            }
+            let config = Arc::new(cfg);
+            self.source = config::with_config(Arc::clone(&config), || match &osr.prepared {
+                PreparedReplay::Standard(prepared) => {
+                    crate::render::wgpu::modes::standard::osr::prepare(
+                        &self.beatmap,
+                        Arc::clone(prepared),
+                        Arc::clone(&osr.gameplay),
+                        osr.font.as_ref().map(|f| (**f).clone()),
+                        self.options.render.dimensions(),
+                    )
+                }
+                PreparedReplay::Taiko(prepared) => {
+                    crate::render::wgpu::modes::taiko::prepare_replay(
+                        Arc::clone(prepared),
+                        Arc::clone(&osr.gameplay),
+                        osr.font.as_ref().map(|f| (**f).clone()),
+                        self.options.render.dimensions(),
+                    )
+                }
+            })?;
+            self.options.core_config = config;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::{
+            gameplay::state::ReplayStatus,
+            replay::{ReplayFrame, ReplayHeader, ReplayMetadata},
+        };
+
+        #[test]
+        fn realtime_replay_seek_audio_and_resize_do_not_change_results() {
+            let mut session = session(false);
+            let expected = session.scene_at_absolute(1500).unwrap();
+            let state = session.replay_timeline().unwrap().state_at(1500.0).clone();
+            session.play(0.0);
+            session.pull_audio(1200.0, 4096);
+            session.seek(1200.0, 900.0);
+            session.set_render_size(414, 232).unwrap();
+            assert_eq!(session.scene_at_absolute(1500).unwrap().size.width, 414);
+            session.set_render_size(826, 464).unwrap();
+            let actual = session.scene_at_absolute(1500).unwrap();
+            assert_eq!(
+                format!("{:?}", expected.commands),
+                format!("{:?}", actual.commands)
+            );
+            assert_eq!(session.replay_timeline().unwrap().state_at(1500.0), &state);
+            assert_eq!(state.status, ReplayStatus::Completed);
+            assert_eq!(state.score, 1_000_000);
+            assert!(session.set_mods(vec!["HR".into()], 1300.0).is_err());
+        }
+
+        #[test]
+        fn failed_replay_freezes_result_while_scene_and_music_continue() {
+            let mut session = session(true);
+            let gameplay = session.replay_timeline().unwrap();
+            assert_eq!(gameplay.state_at(1010.0).status, ReplayStatus::Failed);
+            assert_eq!(gameplay.state_at(1010.0), gameplay.state_at(2500.0));
+            assert_eq!(gameplay.input_at(2500.0).unwrap().keys, 0);
+            assert!(session.timeline.last_object_ms >= 2000);
+            session.set_music(Some(SampleData::mono(vec![0.5; 5000], 1000)));
+            session.seek(0.0, 1700.0);
+            session.play(0.0);
+            assert!(session.pull_audio(0.0, 100).iter().any(|v| *v != 0.0));
+            let scene = session.scene_at_absolute(1900).unwrap();
+            assert!(scene.commands.iter().any(|c| matches!(
+                c,
+                crate::render::scene::DrawCommand::Circle { .. }
+                    | crate::render::scene::DrawCommand::Ring { .. }
+            )));
+        }
+
+        #[test]
+        fn replay_feedback_keeps_gpu_resources_across_frames_and_seek() {
+            let session = session_with_hit_time(true, serde_json::json!([]), 1075);
+            let reference = session.scene_at_absolute(1120).unwrap();
+            let resources = reference
+                .commands
+                .iter()
+                .filter_map(|command| {
+                    if let crate::render::scene::DrawCommand::TransformedSprite {
+                        resource,
+                        additive: true,
+                        ..
+                    } = command
+                    {
+                        Some(Arc::clone(&reference.resources[resource]))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            // PRO 隐藏 GREAT；用 OK 的文字与四个环检查资源复用。
+            assert_eq!(resources.len(), 5);
+            for time in [1150, 1200, 1120] {
+                let frame = session.scene_at_absolute(time).unwrap();
+                let actual = frame
+                    .commands
+                    .iter()
+                    .filter_map(|command| {
+                        if let crate::render::scene::DrawCommand::TransformedSprite {
+                            resource,
+                            additive: true,
+                            ..
+                        } = command
+                        {
+                            Some(&frame.resources[resource])
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual.len(), resources.len());
+                for (original, current) in resources.iter().zip(actual) {
+                    assert!(Arc::ptr_eq(original, current));
+                }
+            }
+        }
+
+        #[test]
+        fn replay_rate_pitch_and_seek_use_recorded_mods() {
+            for (code, speed, pitch) in [
+                ("DT", 1.5, 1.0),
+                ("NC", 1.5, 1.5),
+                ("HT", 0.75, 1.0),
+                ("DC", 0.75, 0.75),
+            ] {
+                let mut session = session_with_mods(false, serde_json::json!([{"acronym":code}]));
+                assert_eq!(session.timeline().beatmap_speed, speed);
+                assert_eq!(session.rate(), speed);
+                assert_eq!(
+                    session.mixer.music_rate(),
+                    MusicRate::chart_domain(speed, pitch)
+                );
+                session.seek(0.0, 1000.0);
+                session.play(0.0);
+                assert_eq!(session.clock_ms(100.0), 1000.0 + 100.0 * speed);
+                session.set_rate(100.0, 2.0);
+                assert_eq!(session.rate(), speed * 2.0);
+                let state = session.replay_timeline().unwrap().state_at(1500.0).clone();
+                session.seek(200.0, 500.0);
+                assert_eq!(session.replay_timeline().unwrap().state_at(1500.0), &state);
+            }
+        }
+
+        fn session(fail: bool) -> RealtimeSession {
+            session_with_mods(fail, serde_json::json!([]))
+        }
+
+        fn session_with_mods(fail: bool, mods: serde_json::Value) -> RealtimeSession {
+            session_with_hit_time(fail, mods, 1010)
+        }
+
+        fn session_with_hit_time(
+            fail: bool,
+            mods: serde_json::Value,
+            hit_time: i64,
+        ) -> RealtimeSession {
+            let raw = format!("osu file format v14\n[General]\nMode:0\n[Difficulty]\nCircleSize:4\nApproachRate:5\nOverallDifficulty:5\n[TimingPoints]\n0,500,4,1,0,100,1,0\n[HitObjects]\n100,100,1000,1,0\n{}", if fail { "400,100,2000,1,0" } else { "" });
+            let beatmap = crate::parse_beatmap_bytes(raw.as_bytes()).unwrap();
+            let replay = ReplayDocument {
+                header: ReplayHeader {
+                    ruleset_id: 0,
+                    version: 30_000_016,
+                    beatmap_md5: "0".repeat(32),
+                    player: String::new(),
+                    replay_hash: String::new(),
+                    counts: [1, 0, 0, 0, 0, 0],
+                    total_score: 1_000_000,
+                    max_combo: 1,
+                    perfect: true,
+                    mods_bits: 0,
+                    life_graph: String::new(),
+                    timestamp_ticks: 0,
+                    online_id: 0,
+                    target_practice_accuracy: None,
+                },
+                metadata: Some(ReplayMetadata {
+                    client_version: "2026.119.0-lazer-windows".into(),
+                    rank: "X".into(),
+                    mods: serde_json::from_value(mods).unwrap(),
+                    statistics: std::collections::BTreeMap::from([("great".into(), 1)]),
+                    maximum_statistics: std::collections::BTreeMap::from([("great".into(), 1)]),
+                    pauses: vec![],
+                    extra: Default::default(),
+                }),
+                frames: vec![
+                    ReplayFrame {
+                        sequence: 0,
+                        time_ms: 0,
+                        delta_ms: 0,
+                        cursor: [100.0; 2],
+                        keys: 0,
+                    },
+                    ReplayFrame {
+                        sequence: 1,
+                        time_ms: hit_time,
+                        delta_ms: hit_time,
+                        cursor: [100.0; 2],
+                        keys: 1,
+                    },
+                ],
+                seed: None,
+                diagnostics: vec![],
+            };
+            let options = RealtimeOptions {
+                render: crate::api::input::RenderConfig {
+                    width: 826,
+                    height: 464,
+                    scale: 1.0,
+                },
+                audio: crate::api::input::AudioConfig {
+                    sample_rate: 1000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            RealtimeSession::from_replay_bundle(
+                ResourceBundle::new(beatmap),
+                options,
+                Arc::new(replay),
+                None,
+            )
+            .unwrap()
+        }
+    }
+}
 
 use std::sync::Arc;
 
@@ -7,10 +486,10 @@ use super::input::{ImageData, RealtimeOptions, ResourceBundle};
 use super::output::{RealtimeMode, TimelineInfo};
 use super::stream::{AudioStream, RESEEK_TOLERANCE_MS};
 use crate::config;
+use crate::domain::mods::{parse_mods, validate_mods_for_level, ModSettings, ModSupportLevel};
 use crate::hitsound::{
     self, HitsoundMixer, HitsoundTimeline, MusicRate, SampleData, SampleLibrary,
 };
-use crate::model::mods::{parse_mods, validate_mods, ModSettings};
 use crate::model::{Beatmap, HitObjects};
 use crate::processing::conversion::{catch_convert, mania_convert, taiko_convert};
 use crate::processing::timeline::{preview_start_ms, TimeAxis, PREVIEW_END_PADDING_MS};
@@ -25,6 +504,8 @@ use crate::support::error::{PreviewError, Result};
 /// 把混音结果送进音频设备，并把音频线程的消费位置转发回来，音画时间只有一处实现。
 #[derive(Debug, Clone)]
 pub struct RealtimeSession {
+    #[cfg(feature = "replay")]
+    osr: Option<Arc<osr::OsrSessionData>>,
     source_beatmap: Beatmap,
     beatmap: Beatmap,
     timeline: TimelineInfo,
@@ -134,6 +615,8 @@ impl RealtimeSession {
         clock.seek(timeline.absolute_start_ms as f64, 0.0);
         let storyboard_enabled = options.storyboard_enabled;
         Ok(Self {
+            #[cfg(feature = "replay")]
+            osr: None,
             source_beatmap,
             beatmap,
             timeline,
@@ -184,6 +667,10 @@ impl RealtimeSession {
     /// `wall_ms` 是当前墙钟读数：切换可能改变谱面变速，时钟必须在这一刻换速而不是
     /// 让时刻跳变。事件时间轴也随谱面重建，样本随后由宿主重新装载。
     pub fn set_mods(&mut self, mods: Vec<String>, wall_ms: f64) -> Result<()> {
+        #[cfg(feature = "replay")]
+        if self.osr.is_some() {
+            return Err(PreviewError::new("OSR 回放禁止修改 Mod"));
+        }
         let settings = parse_mods(&mods)?;
         let target_mode = self.mode_as_i32();
         validate_realtime_mods(&settings, target_mode)?;
@@ -213,6 +700,58 @@ impl RealtimeSession {
             .set_music_rate(MusicRate::chart_domain(speed, settings.music_pitch()));
         self.settings = settings;
         self.rebuild_hitsound_timeline();
+        Ok(())
+    }
+
+    /// 仅重建 Standard 的光标显示配置与帧源，保持播放时钟和音频不变。
+    pub fn set_show_cursor(&mut self, enabled: bool) -> Result<()> {
+        #[cfg(feature = "replay")]
+        if self.osr.is_some() {
+            return Err(PreviewError::new("OSR 回放光标由回放数据控制"));
+        }
+        let style = &self.options.core_config.render.standard.mp4.style;
+        if style.SHOW_CURSOR == enabled {
+            return Ok(());
+        }
+        let mut config = (*self.options.core_config).clone();
+        config.render.standard.mp4.style.SHOW_CURSOR = enabled;
+        let config = Arc::new(config);
+        if self.mode_as_i32() == 0 {
+            self.source = prepare_source(
+                &self.beatmap,
+                0,
+                &self.settings,
+                TimeAxis::new(self.timeline.first_object_ms),
+                &config,
+            )?;
+        }
+        self.options.core_config = config;
+        Ok(())
+    }
+
+    /// 仅重建 Catch 的接盘显示配置与帧源，保持播放时钟和音频不变。
+    pub fn set_show_catcher(&mut self, enabled: bool) -> Result<()> {
+        #[cfg(feature = "replay")]
+        if self.osr.is_some() {
+            return Err(PreviewError::new("OSR 回放接盘由回放数据控制"));
+        }
+        let style = &self.options.core_config.render.catch.mp4.style;
+        if style.SHOW_CATCHER == enabled {
+            return Ok(());
+        }
+        let mut config = (*self.options.core_config).clone();
+        config.render.catch.mp4.style.SHOW_CATCHER = enabled;
+        let config = Arc::new(config);
+        if self.mode_as_i32() == 2 {
+            self.source = prepare_source(
+                &self.beatmap,
+                2,
+                &self.settings,
+                TimeAxis::new(self.timeline.first_object_ms),
+                &config,
+            )?;
+        }
+        self.options.core_config = config;
         Ok(())
     }
 
@@ -319,129 +858,11 @@ impl RealtimeSession {
         }
         self.options.render.width = width;
         self.options.render.height = height;
+        #[cfg(feature = "replay")]
+        if self.osr.is_some() {
+            self.prepare_replay_source()?;
+        }
         Ok(())
-    }
-
-    // ── 音频：音乐与打击音同流混音 ──────────────────────────────────────
-    //
-    // 时间、倍速与 seek 由会话时钟统一驱动；宿主只需把 `pull_audio` 的输出送进
-    // 音频设备，并把音频线程的消费位置用 `on_audio_clock` 转发回来。
-
-    /// 设置背景音乐（`None` 表示清除）；与打击音共用同一时间轴，倍速、seek、暂停
-    /// 只有一处位置计算。没有音乐的谱面（单独的 `.osu`）不必调用它。
-    pub fn set_music(&mut self, music: Option<SampleData>) {
-        self.mixer.set_music(music);
-    }
-
-    /// 更新音乐音量百分比（0..=100）。
-    pub fn set_music_volume(&mut self, volume: i32) {
-        self.mixer.set_music_gain(hitsound::volume_gain(volume));
-    }
-
-    /// 打开/关闭打击音；关闭时事件时间轴为空，音乐照常输出。
-    pub fn set_hitsound_enabled(&mut self, enabled: bool) {
-        if self.hitsound_enabled == enabled {
-            return;
-        }
-        self.hitsound_enabled = enabled;
-        self.rebuild_hitsound_timeline();
-    }
-
-    pub fn hitsound_enabled(&self) -> bool {
-        self.hitsound_enabled
-    }
-
-    /// 更新打击音音量百分比（0..=100）。
-    pub fn set_hitsound_volume(&mut self, volume: i32) {
-        self.mixer.set_master_gain(hitsound::volume_gain(volume));
-    }
-
-    /// 当前谱面需要样本库提供的样本名（按优先级排列，含裸名回退）；缺失的样本在混音
-    /// 时按静音处理，宿主只装载拿得到的名字。NC 生效时额外带上 4 个节拍鼓点样本名。
-    pub fn hitsound_required_names(&self) -> Vec<String> {
-        let mut names = hitsound::referenced_names(&self.beatmap);
-        if let Some((storyboard, _)) = &self.storyboard {
-            names.extend(storyboard.samples.iter().map(|sample| sample.path.clone()));
-        }
-        if self.settings.nightcore {
-            names.extend(hitsound::NIGHTCORE_SAMPLE_NAMES.map(str::to_string));
-        }
-        let mut seen = std::collections::HashSet::new();
-        names.retain(|name| seen.insert(name.clone()));
-        names
-    }
-
-    /// 故事板音效始终取自谱面包，不受皮肤打击音来源开关影响。
-    pub fn storyboard_sample_names(&self) -> Vec<String> {
-        self.storyboard
-            .as_ref()
-            .map_or_else(Vec::new, |(storyboard, _)| {
-                storyboard
-                    .samples
-                    .iter()
-                    .map(|sample| sample.path.clone())
-                    .collect()
-            })
-    }
-
-    /// 放入一段已解码的样本 PCM。只放进样本库、不重建时间轴：宿主应把样本全部放完后
-    /// 调用一次 [`RealtimeSession::rebuild_hitsound_timeline`]，否则每个样本都遍历整张谱面。
-    pub fn set_hitsound_sample(
-        &mut self,
-        name: &str,
-        channels: hitsound::Channels,
-        sample_rate: u32,
-        loop_len: usize,
-    ) {
-        let data = SampleData {
-            channels,
-            sample_rate: sample_rate.max(1),
-            loop_len,
-        };
-        self.mixer.library_mut().insert(name, data);
-    }
-
-    /// 用当前样本库重建打击音事件时间轴（样本全部放完后调用一次）。
-    /// 打击音关闭时只留 NC 节拍鼓点（鼓点属于 Mod，不受该开关影响）；
-    /// 重建会清空正在播放的声音，只在装载阶段调用。
-    pub fn rebuild_hitsound_timeline(&mut self) {
-        let mut timeline = if self.hitsound_enabled {
-            hitsound::build_timeline(&self.beatmap, self.mixer.library())
-        } else {
-            HitsoundTimeline::default()
-        };
-        if self.settings.nightcore {
-            let end_ms = (self.timeline.absolute_start_ms + self.timeline.duration_ms) as f64;
-            timeline.merge(hitsound::nightcore_events(
-                &self.beatmap,
-                self.mixer.library(),
-                end_ms,
-            ));
-        }
-        if self.storyboard_enabled {
-            if let Some((storyboard, _)) = &self.storyboard {
-                let mut samples = storyboard.sample_timeline(self.mixer.library());
-                let start = self.timeline.absolute_start_ms as f64;
-                // 游戏允许故事板音效晚启动不足 100ms；开场前 98ms 的 intro.mp3
-                // 应从样本头开始播放，远早于起点的事件则仍跳过，不能改变预览起点。
-                for event in &mut samples.events {
-                    if event.start_ms < start && start - event.start_ms < 100.0 {
-                        event.start_ms = start;
-                    }
-                }
-                timeline.merge(samples);
-            }
-        }
-        self.mixer.rebuild_timeline_events(timeline);
-    }
-
-    /// 清空已放入的样本并重建时间轴（保留音乐、音量与开关设置）。
-    ///
-    /// 切 Mod 或转谱后需要的样本集合会变，宿主重新装载即可，不必重建会话。
-    pub fn reset_hitsound_samples(&mut self) {
-        *self.mixer.library_mut() = SampleLibrary::new();
-        self.rebuild_hitsound_timeline();
-        self.mixer.stop_all();
     }
 
     // ── 时钟 ───────────────────────────────────────────────────────────
@@ -467,7 +888,7 @@ impl RealtimeSession {
         }
         self.clock.seek(chart_ms, wall_ms);
         self.stream.reset(chart_ms);
-        self.mixer.seek(chart_ms);
+        self.seek_mixer(chart_ms);
     }
 
     /// 设置用户倍速（不含 DT/HT；总倍速由会话乘上谱面变速）。
@@ -510,7 +931,7 @@ impl RealtimeSession {
         let drift = consumer_ms - clock_ms;
         if drift.abs() > RESEEK_TOLERANCE_MS {
             self.stream.reset(clock_ms);
-            self.mixer.seek(clock_ms);
+            self.seek_mixer(clock_ms);
         } else {
             self.clock.anchor_audio(consumer_ms, wall_ms);
         }
@@ -586,7 +1007,19 @@ impl RealtimeSession {
                     }
                 }),
             storyboard_layers,
-            self.options.video_style,
+            {
+                let style = self.options.video_style;
+                #[cfg(feature = "replay")]
+                let style = if self.osr.is_some() {
+                    crate::render::wgpu::VideoStyle {
+                        label_font_size: 0,
+                        ..style
+                    }
+                } else {
+                    style
+                };
+                style
+            },
         )
         .map_err(|error| PreviewError::render(error.to_string()))
     }
@@ -645,7 +1078,7 @@ fn converted_beatmap(
 }
 
 fn validate_realtime_mods(settings: &ModSettings, target_mode: i32) -> Result<()> {
-    let mode_errors = validate_mods(settings, Some(target_mode), Some("mp4"));
+    let mode_errors = validate_mods_for_level(settings, target_mode, ModSupportLevel::Realtime);
     if mode_errors.is_empty() {
         Ok(())
     } else {
@@ -791,6 +1224,30 @@ mod tests {
         };
         RealtimeSession::from_bundle(ResourceBundle::new(beatmap), test_options())
             .expect("测试会话必须可以创建")
+    }
+
+    #[test]
+    fn standard_session_accepts_realtime_mod_names_and_enforces_input_conflicts() {
+        let mut session = session();
+        for name in [
+            "classic",
+            "relax",
+            "spun-out",
+            "autopilot",
+            "alternate",
+            "single-tap",
+            "mirror",
+        ] {
+            session.set_mods(vec![name.into()], 0.0).unwrap();
+            assert_eq!(session.mods(), [name]);
+        }
+        assert!(session
+            .set_mods(vec!["mirror".into(), "hard-rock".into()], 0.0)
+            .is_err());
+        assert!(session
+            .set_mods(vec!["alternate".into(), "single-tap".into()], 0.0)
+            .is_err());
+        session.set_mods(Vec::new(), 0.0).unwrap();
     }
 
     /// 构造一个首个物件在 `first_ms`、带 `AudioLeadIn` 的会话。
@@ -1187,6 +1644,90 @@ mod tests {
         assert!(!session.hitsound_enabled());
     }
 
+    #[test]
+    fn cursor_toggle_preserves_playback_and_survives_mods_and_resize() {
+        let mut session = session();
+        session.seek(100.0, 0.0);
+        session.play(100.0);
+        let hidden = session.scene_at_absolute(0).unwrap().commands.len();
+        let epoch = session.audio_epoch();
+        assert!(
+            !session
+                .options()
+                .core_config
+                .render
+                .standard
+                .mp4
+                .style
+                .SHOW_CURSOR
+        );
+        session.set_show_cursor(true).unwrap();
+        assert!(session.scene_at_absolute(0).unwrap().commands.len() > hidden);
+        assert_eq!(session.audio_epoch(), epoch);
+        assert_eq!(session.clock_ms(200.0), 100.0);
+        session.set_mods(vec!["HR".into()], 200.0).unwrap();
+        session.set_render_size(854, 480).unwrap();
+        assert!(
+            session
+                .options()
+                .core_config
+                .render
+                .standard
+                .mp4
+                .style
+                .SHOW_CURSOR
+        );
+        session.set_show_cursor(false).unwrap();
+        let without_cursor = session.scene_at_absolute(0).unwrap().commands.len();
+        session.set_show_cursor(true).unwrap();
+        assert!(session.scene_at_absolute(0).unwrap().commands.len() > without_cursor);
+    }
+
+    #[test]
+    fn catcher_toggle_preserves_playback_and_survives_mods_and_resize() {
+        let beatmap = crate::parse_beatmap_bytes(
+            b"osu file format v14\n[General]\nMode:2\n[Difficulty]\nCircleSize:5\nApproachRate:5\n[TimingPoints]\n0,500,4,1,0,100,1,0\n[HitObjects]\n0,192,1000,1,0\n512,192,2000,1,0\n",
+        ).unwrap();
+        let mut session =
+            RealtimeSession::from_bundle(ResourceBundle::new(beatmap), test_options()).unwrap();
+        session.seek(100.0, 0.0);
+        session.play(100.0);
+        let hidden = session.scene_at_absolute(1000).unwrap().commands.len();
+        let epoch = session.audio_epoch();
+        assert!(
+            !session
+                .options()
+                .core_config
+                .render
+                .catch
+                .mp4
+                .style
+                .SHOW_CATCHER
+        );
+        session.set_show_catcher(true).unwrap();
+        assert!(session.scene_at_absolute(1000).unwrap().commands.len() > hidden);
+        assert_eq!(session.audio_epoch(), epoch);
+        assert_eq!(session.clock_ms(200.0), 100.0);
+        session
+            .set_mods(vec!["HR".into(), "FL".into()], 200.0)
+            .unwrap();
+        session.set_render_size(854, 480).unwrap();
+        assert!(
+            session
+                .options()
+                .core_config
+                .render
+                .catch
+                .mp4
+                .style
+                .SHOW_CATCHER
+        );
+        session.set_show_catcher(false).unwrap();
+        let hidden = session.scene_at_absolute(1000).unwrap().commands.len();
+        session.set_show_catcher(true).unwrap();
+        assert!(session.scene_at_absolute(1000).unwrap().commands.len() > hidden);
+    }
+
     /// 背景暗化运行时可调并夹紧到 0～1；背景/视频/故事板三层共用这一系数。
     #[test]
     fn background_dim_is_runtime_adjustable_and_clamped() {
@@ -1200,7 +1741,7 @@ mod tests {
     }
     /// Tewi Maze 同刻多物件曾触发零时长 hyperdash 切片崩溃，需反复热切换验证。
     #[test]
-    fn catch_overlapping_objects_allow_repeated_at_and_fl_switches() {
+    fn catch_overlapping_objects_allow_repeated_fl_switches() {
         // 内嵌最小复现：双物件、七物件重叠及后续跳转，不依赖额外谱面文件。
         let beatmap = crate::parse_beatmap_bytes(
             b"osu file format v14\n[General]\nMode:2\n\
@@ -1217,13 +1758,11 @@ mod tests {
             RealtimeSession::from_bundle(ResourceBundle::new(beatmap), RealtimeOptions::default())
                 .unwrap();
         for tokens in [
-            vec!["AT"],
-            vec![],
-            vec!["AT", "FL"],
             vec!["FL"],
-            vec!["AT", "HR"],
-            vec!["AT", "EZ"],
-            vec!["AT"],
+            vec![],
+            vec!["FL", "HR"],
+            vec!["FL", "EZ"],
+            vec![],
         ] {
             session
                 .set_mods(tokens.into_iter().map(str::to_string).collect(), 0.0)
