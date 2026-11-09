@@ -90,6 +90,14 @@ frames = (
     '0|100|100|0,1000|100|100|1,1|100|100|0,499|200|100|1,'
     '1|200|100|0,999|200|100|0,'
 ) + '-12345|0|0|1,'
+if len(sys.argv) > 4 and sys.argv[4] == 'smoke':
+    tokens = []
+    for token in frames.rstrip(',').split(','):
+        parts = token.split('|')
+        if parts[0] != '-12345':
+            parts[3] = str(int(parts[3]) | 16)
+        tokens.append('|'.join(parts))
+    frames = ','.join(tokens) + ','
 compressed = lzma.compress(frames.encode(), format=lzma.FORMAT_ALONE)
 osr_path.write_bytes(
     struct.pack('<Bi', mode, 20200101)
@@ -132,6 +140,9 @@ assert result['status'] == 'success', result
 assert result['replay-info']['rulesetId'] == mode, result
 assert result['replay-info']['player'] == 'Python test', result
 assert result['replay-info']['cache-hit'] is False, result
+(root / 'state.json').write_text(
+    json.dumps(result['replay-info']['state'], sort_keys=True), encoding='utf-8'
+)
 output = Path(result['preview-img'])
 assert output.is_file() and output.is_relative_to(root / 'output'), output
 if fmt == 'mp4':
@@ -171,6 +182,26 @@ def test_local_replay_renders_offline(tmp_path: Path, mode: int, format: str) ->
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2, 3])
+@pytest.mark.parametrize("format", ["png", "gif", "mp4"])
+def test_smoke_flag_renders_in_every_ruleset(tmp_path: Path, mode: int, format: str) -> None:
+    for label in ["normal", "smoke"]:
+        root = tmp_path / label
+        root.mkdir()
+        result = subprocess.run(
+            [sys.executable, "-c", RENDER_REPLAY, str(root), str(mode), format, label],
+            env={**os.environ, "TEMP": str(root), "TMP": str(root)},
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+    normal = (tmp_path / "normal" / "state.json").read_text()
+    smoke = (tmp_path / "smoke" / "state.json").read_text()
+    assert normal == smoke
 
 
 def test_online_sources_and_player_defaults_reach_authentication(tmp_path: Path) -> None:

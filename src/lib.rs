@@ -130,6 +130,7 @@ fn generate_preview_json(
     score_select = None,
     mode = None,
     include_fails = false,
+    approximate_replay = false,
     osu_file = None,
     osz_file = None,
     format = None,
@@ -150,6 +151,7 @@ fn generate_replay_preview_json(
     score_select: Option<String>,
     mode: Option<String>,
     include_fails: bool,
+    approximate_replay: bool,
     osu_file: Option<String>,
     osz_file: Option<String>,
     format: Option<String>,
@@ -209,6 +211,7 @@ fn generate_replay_preview_json(
     request.view.time_points = parse_time_points(times.as_deref())?;
     request.view.duration_seconds = duration_time;
     request.execution.no_cache = no_cache;
+    request.execution.approximate_replay = approximate_replay;
     request.execution.config = config;
     render_request_json(py, request)
 }
