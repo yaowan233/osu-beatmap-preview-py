@@ -13,6 +13,8 @@ mod objects;
 mod schedule;
 pub(crate) mod taiko;
 pub use taiko::compile_taiko;
+mod catch;
+pub use catch::compile_catch;
 
 pub fn compile_standard(
     prepared: &PreparedStandard,
@@ -257,3 +259,6 @@ fn maximum_statistics(
 
 #[cfg(test)]
 mod tests;
+
+mod mania;
+pub use mania::compile_mania;

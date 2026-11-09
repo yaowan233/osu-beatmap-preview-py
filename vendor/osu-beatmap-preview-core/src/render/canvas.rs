@@ -309,10 +309,13 @@ impl Img {
     // ─── 绘图原语 ───
 
     pub fn fill_rect(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, color: Rgba) {
-        let xa = x0.max(0) as u32;
-        let ya = y0.max(0) as u32;
-        let xb = (x1 + 1).clamp(0, self.w as i64) as u32;
-        let yb = (y1 + 1).clamp(0, self.h as i64) as u32;
+        let xa = x0.clamp(0, self.w as i64) as u32;
+        let ya = y0.clamp(0, self.h as i64) as u32;
+        let xb = x1.saturating_add(1).clamp(0, self.w as i64) as u32;
+        let yb = y1.saturating_add(1).clamp(0, self.h as i64) as u32;
+        if xa >= xb || ya >= yb {
+            return;
+        }
         if color[3] == 255 {
             for y in ya..yb {
                 let i = self.idx(xa, y);
@@ -738,6 +741,14 @@ fn blend_into(dst: &mut [u8], src: Rgba) {
         dst.copy_from_slice(&src);
         return;
     }
+    if da == 255 {
+        // 不透明背景的输出 alpha 恒为 255，可约去通用公式中的公因子，
+        // 避免每个通道做动态除法；整数舍入与通用 src-over 公式完全相同。
+        for c in 0..3 {
+            dst[c] = ((src[c] as u32 * sa + dst[c] as u32 * (255 - sa) + 127) / 255) as u8;
+        }
+        return;
+    }
     let out_a = sa * 255 + da * (255 - sa); // scaled by 255
     for c in 0..3 {
         let sc = src[c] as u32;
@@ -844,6 +855,27 @@ mod tests {
     use super::Img;
 
     #[test]
+    fn opaque_blending_matches_general_src_over_rounding() {
+        for alpha in 0..=255u32 {
+            for source in 0..=255u32 {
+                for destination in 0..=255u32 {
+                    let mut pixel = [destination as u8; 4];
+                    pixel[3] = 255;
+                    super::blend_into(
+                        &mut pixel,
+                        [source as u8, source as u8, source as u8, alpha as u8],
+                    );
+                    let out_a = alpha * 255 + 255 * (255 - alpha);
+                    let expected =
+                        ((source * alpha * 255 + destination * 255 * (255 - alpha) + out_a / 2)
+                            / out_a) as u8;
+                    assert_eq!(pixel, [expected, expected, expected, 255]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn size_rectangles_draw_exact_half_open_dimensions() {
         let background = [0, 0, 0, 0];
         let fill = [10, 20, 30, 128];
@@ -877,6 +909,28 @@ mod tests {
         image.set_rect_size(0, 0, 3, -1, [255, 0, 0, 255]);
 
         assert!(image.data.chunks_exact(4).all(|pixel| pixel == background));
+    }
+
+    #[test]
+    fn fill_rect_clips_offscreen_and_reversed_bounds() {
+        let background = [1, 2, 3, 255];
+        for alpha in [128, 255] {
+            let mut image = Img::new(4, 4, background);
+            let color = [255, 0, 0, alpha];
+            for (x0, y0, x1, y1) in [
+                (5, 0, 8, 3),
+                (-8, 0, -5, 3),
+                (0, 5, 3, 8),
+                (0, -8, 3, -5),
+                (3, 0, 1, 3),
+            ] {
+                image.fill_rect(x0, y0, x1, y1, color);
+            }
+            assert!(image.data.chunks_exact(4).all(|pixel| pixel == background));
+            image.fill_rect(3, 3, i64::MAX, i64::MAX, color);
+            assert_ne!(image.get(3, 3), background);
+            assert_eq!(image.get(2, 3), background);
+        }
     }
     #[test]
     fn tiled_polyline_matches_pixel_distance_union() {

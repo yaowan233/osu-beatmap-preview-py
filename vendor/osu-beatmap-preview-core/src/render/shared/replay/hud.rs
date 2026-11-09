@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 pub(crate) struct HudVisuals {
     pub font: Option<super::font::ArgonFont>,
+    pub combo_center: Option<[i64; 2]>,
+    pub hit_error_bottom: f64,
     pub hit_error_axis: Arc<Img>,
     health: HealthAnimation,
     windows: [f64; 3],
@@ -25,6 +27,8 @@ impl HudVisuals {
         windows: [f64; 3],
     ) -> Self {
         Self {
+            combo_center: None,
+            hit_error_bottom: HIT_ERROR_BOTTOM,
             font,
             hit_error_axis: build_hit_error_axis(scale, windows),
             health: HealthAnimation::new(gameplay),
@@ -93,16 +97,21 @@ pub(crate) fn draw(
     let state = gameplay.state_at(time);
     let pink = [252, 97, 143, 255];
     draw_health(image, visuals.health.at(time), scale);
-    draw_hit_error_meter(
-        image,
-        gameplay,
-        visuals,
-        time,
-        width,
-        height,
-        px,
-        visuals.windows[2],
-    );
+    if !matches!(
+        gameplay.policy,
+        crate::replay::compatibility::ReplayPolicy::Catch(_)
+    ) {
+        draw_hit_error_meter(
+            image,
+            gameplay,
+            visuals,
+            time,
+            width,
+            height,
+            px,
+            visuals.windows[2],
+        );
+    }
     draw_score(image, state, visuals, width, px, scale);
     draw_summary(image, state, visuals, width, px, scale);
     draw_combo(image, state.combo, visuals, height, px, scale);
@@ -353,8 +362,10 @@ fn tick_shape(age: f64) -> (f64, f64) {
 
 fn tick_colour(result: HitResult, alpha: f64) -> [u8; 4] {
     let base = match result {
-        HitResult::Great | HitResult::SliderTailHit => HIT_ERROR_GREAT,
-        HitResult::Ok | HitResult::LargeTickHit | HitResult::SmallTickHit => HIT_ERROR_OK,
+        HitResult::Perfect | HitResult::Great | HitResult::SliderTailHit => HIT_ERROR_GREAT,
+        HitResult::Good | HitResult::Ok | HitResult::LargeTickHit | HitResult::SmallTickHit => {
+            HIT_ERROR_OK
+        }
         HitResult::Meh => HIT_ERROR_MEH,
         HitResult::Miss | HitResult::LargeTickMiss | HitResult::SmallTickMiss => HIT_ERROR_MISS,
         _ => [200, 200, 200],
@@ -379,7 +390,7 @@ fn draw_hit_error_meter(
     max_window: f64,
 ) {
     let axis = &visuals.hit_error_axis;
-    let axis_y = height as f64 - px(HIT_ERROR_BOTTOM) as f64;
+    let axis_y = height as f64 - px(visuals.hit_error_bottom) as f64;
     image.shared_sprite(
         axis,
         width / 2 - axis.w as i64 / 2,
@@ -486,8 +497,15 @@ fn draw_combo(
     px: impl Fn(f64) -> i64,
     scale: f64,
 ) {
-    let combo = hud_text(visuals, &format!("{}x", combo_value), 36.0, [255; 4], scale);
-    image.shared_sprite(&combo, px(12.0), height - combo.h as i64 - px(8.0));
+    if let Some([x, y]) = visuals.combo_center {
+        if combo_value > 0 {
+            let combo = hud_text(visuals, &combo_value.to_string(), 38.0, [255; 4], scale);
+            image.shared_sprite(&combo, x - combo.w as i64 / 2, y - combo.h as i64 / 2);
+        }
+    } else {
+        let combo = hud_text(visuals, &format!("{}x", combo_value), 36.0, [255; 4], scale);
+        image.shared_sprite(&combo, px(12.0), height - combo.h as i64 - px(8.0));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -555,6 +573,37 @@ pub(crate) fn hud_text(
         || shared_text_sprite(value, scaled_bitmap_font_height(size as u32, scale), color),
         |font| font.sprite_arc(value, size * scale, 0.0, [color[0], color[1], color[2]]),
     )
+}
+
+/// 各模式共用右侧居中的按键面板；按键语义由模式转换后传入。
+pub(crate) fn draw_keys(
+    target: &mut impl OverlayCanvas,
+    visuals: &HudVisuals,
+    layout: HudLayout,
+    keys: &[(bool, &str)],
+) {
+    let px = |value: f64| (value * layout.scale).round() as i64;
+    for (i, &(active, name)) in keys.iter().enumerate() {
+        let x = layout.width - px(43.0);
+        let y = layout.height / 2 + px(i as f64 * 31.0 - keys.len() as f64 * 15.5);
+        target.fill_rect_size(
+            x,
+            y,
+            px(34.0),
+            px(26.0),
+            if active {
+                [252, 97, 143, 255]
+            } else {
+                [27, 23, 39, 205]
+            },
+        );
+        let label = hud_text(visuals, name, 18.0, [255; 4], layout.scale);
+        target.shared_sprite(
+            &label,
+            x + (px(34.0) - label.w as i64) / 2,
+            y + (px(26.0) - label.h as i64) / 2,
+        );
+    }
 }
 
 #[cfg(test)]

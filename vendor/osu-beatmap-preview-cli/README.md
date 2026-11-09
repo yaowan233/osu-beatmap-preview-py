@@ -33,8 +33,8 @@ osu-beatmap-preview-cli --bid=738063 --fmt=mp4 --time-points=preview --duration-
 # 本地谱面包，使用 --bid 选择难度
 osu-beatmap-preview-cli --osz-file=map.osz --bid=738063 --fmt=mp4
 
-# 本地回放，默认输出 MP4
-osu-beatmap-preview-cli --type=osr --osr-file=play.osr --osz-file=map.osz
+# 本地回放，Standard 默认 GIF，其他模式默认 PNG
+osu-beatmap-preview-cli --type=osr --osr-file=play.osr --osu-file=map.osu
 ```
 
 ## 命令行参数
@@ -51,10 +51,10 @@ osu-beatmap-preview-cli --type=osr --osr-file=play.osr --osz-file=map.osz
 | `--score-id=<ID>` | 下载统一成绩 ID 的回放，需要 `--type=osr` |
 | `--user=<用户名>` | 查询玩家回放，需要 `--type=osr`；纯数字也按用户名查询 |
 | `--score-select=best\|recent` | 仅玩家查询：有 `--bid` 时默认 `best`，无 `--bid` 时默认 `recent` |
-| `--mode=osu\|taiko\|fruits\|mania` | 仅玩家查询；指定谱面时省略默认 `osu`，无谱面时由官方使用玩家默认模式 |
+| `--mode=osu\|taiko\|fruits\|mania` | 仅玩家查询；`osu` 别名为 `std`、`standard`，`fruits` 别名为 `fruit`、`ctb`、`catch`；省略时，指定谱面则使用谱面原生模式，无谱面则由官方使用玩家默认模式 |
 | `--include-fails` | 最近成绩查询包含失败成绩；默认排除，指定谱面时需搭配 `--score-select=recent` |
 | `--convert=<模式>` | `standard` / `std`、`taiko`、`ctb`、`mania`；只有 Standard 可转其他模式，同模式视为无操作 |
-| `--fmt=png\|gif\|mp4` | 谱面默认 Standard 为 GIF、其他为 PNG；回放默认 MP4，支持 PNG/GIF/MP4 |
+| `--fmt=png\|gif\|mp4` | 默认 Standard 为 GIF、其他为 PNG；支持 PNG/GIF/MP4 |
 | `--mod=<Mod>` | 缩写或全名，不区分大小写；全名空格写成短横杠，如 `hard-rock` |
 | `--time-points=<秒数或preview>` | 片段起点；GIF、Standard PNG 可重复，MP4 与其他模式 PNG 最多一个 |
 | `--duration-time=<秒数>` | GIF 每段时长、MP4 时长或区间段 PNG 时长；必须为有限正数 |
@@ -104,7 +104,7 @@ osu-beatmap-preview-cli --osu-file=edited.osu --osz-file=map.osz --fmt=mp4
 osu-beatmap-preview-cli --type=osr --osr-file=play.osr --osu-file=map.osu --fmt=gif
 
 # 离线 MP4，需要匹配的完整谱面包
-osu-beatmap-preview-cli --type=osr --osr-file=play.osr --osz-file=map.osz
+osu-beatmap-preview-cli --type=osr --osr-file=play.osr --osz-file=map.osz --fmt=mp4
 
 # 在线成绩或指定谱面的个人最高分
 osu-beatmap-preview-cli --type=osr --score-id=6086051920
@@ -120,12 +120,21 @@ osu-beatmap-preview-cli --type=osr --user="玩家名" --mode=osu --include-fails
 
 ### 输出与兼容性
 
-- **PNG/GIF**：只使用 `.osu` 与 `.osr`，不读取或下载 OSZ，不加载音频、背景、视频或故事板。PNG 支持 Standard，使用 `render.standard.png` 的快照网格、选段、标签和缩放配置；GIF 支持 Standard 与 Taiko，默认 2×2 同时播放不同片段，分别使用 `render.standard.gif`、`render.taiko.gif` 配置，每格显示对应时刻的回放与 HUD。
-- **MP4**：使用完整 OSZ 加载音乐、背景与音效，画面与音频开关使用 `render.standard.mp4` 配置。缺少资源时自动查谱下载。
-- **谱面匹配**：按回放记录的原始 `.osu` 字节 MD5 校验；MP4 同时提供外部谱面与媒体包时，两份谱面都必须匹配。
-- **Mod**：使用回放文件中的 Mod，不接受 `--convert` 或 `--mod`。
-- **兼容性**：支持 stable、lazer、tachyon 回放；成绩按当前游戏规则重算，可能与历史记录不同。
-- **提前结束**：输入提前结束时显示失败，冻结成绩与光标，清空按键并停止玩家音效；MP4 中背景、谱面和音乐继续播放。
+四模式回放均支持 PNG、GIF 和 MP4：
+
+| 格式 | 预览内容与资源 |
+| --- | --- |
+| PNG | Standard 使用快照网格，Taiko 使用分行时间轴，Catch、Mania 使用分列时间轴；显示回放输入、判定及成绩，选段方式见[输出格式与选段](#输出格式与选段) |
+| GIF | 默认 2×2 网格同时播放不同片段，每格显示回放与 HUD，无音频 |
+| MP4 | 单画面回放，包含音乐、背景与音效；缺少完整 OSZ 时自动查谱下载 |
+
+PNG/GIF 只使用匹配的 `.osu` 与 `.osr`，不读取或下载 OSZ，也不加载音频、背景、视频或故事板。输出使用各模式、各格式的 `render.<模式>.<格式>` 配置。
+
+静态时间轴用颜色区分判定，并标注 ACC 与评级。Mania 的按下与持续时间以短横线和竖直拖尾表示；左侧 `+` 表示早、`-` 表示晚，漏打或长按中断等无击打误差的判定用 `o` 表示。
+
+支持 stable、lazer、tachyon 回放，成绩按当前游戏规则重算，可能与历史记录不同。谱面以原始 `.osu` 字节 MD5 校验；MP4 同时提供外部谱面与媒体包时，两份谱面都必须匹配。回放 Mod 与输出效果见 [Mod 支持](#mod-支持)。
+
+GIF/MP4 中，Mania 的连击与判定位置使用 `skin.MANIA.KEYS_N` 的 `COMBO_POSITION`、`SCORE_POSITION`（480 高坐标系）。输入提前结束时显示失败，冻结成绩与光标，清空按键并停止玩家音效；MP4 中背景、谱面和音乐继续播放。
 
 ### 官方 API 认证
 
@@ -148,7 +157,7 @@ download:
 | Taiko PNG | 按游玩顺序排成多行，显示节拍线、BPM 与 SV |
 | Catch PNG | 按谱面进度排成多列 |
 | Mania PNG | 按键道绘制，长谱自动分列，显示 BPM 与 SV |
-| GIF | Standard/Catch 为 2×2 网格，Taiko 为 4 行，Mania 为 4 列 |
+| GIF | 四模式均为 2×2 网格，每格独立播放不同片段 |
 | MP4 | 四模式单画面视频，H.264 + AAC，支持 MP3、OGG、WAV 音源 |
 
 数值时间点使用游戏时间：转谱后目标模式的首个可玩物件为 `0:00`，不是音轨绝对时间。`preview` 使用谱面 `PreviewTime`，无效时回退到首个物件。
@@ -171,16 +180,20 @@ Windows 自动尝试 NVENC 或 AMF，失败时回退 CPU OpenH264；其他平台
 
 ## Mod 支持
 
-下表按 **PNG → GIF/MP4 → 实时预览** 累积支持，后两列只列新增 Mod。
+普通谱面预览按下表的 **PNG → GIF/MP4 → 实时预览** 累积支持，后两列只列新增 Mod。
 
 | 模式 | PNG | GIF / MP4（新增） | 实时预览（新增） |
 | --- | --- | --- | --- |
 | Standard | Easy、Hard-Rock、Hidden、Flashlight、Difficulty-Adjust、Traceable、Mirror | Double-Time、Half-Time、Nightcore、Daycore | Classic、Relax、Spun-Out、Autopilot、Alternate、Single-Tap |
 | Taiko | Easy、Hard-Rock、Swap | Hidden、Flashlight、Constant-Speed、Double-Time、Half-Time、Nightcore、Daycore | Classic |
-| Catch | Easy、Hard-Rock | Hidden、Flashlight、Double-Time、Half-Time、Nightcore、Daycore | 无新增 |
-| Mania | One-Key 至 Ten-Keys、Dual-Stages、Invert、Hold-Off、Mirror | Hidden、Flashlight、Constant-Speed、Double-Time、Half-Time、Nightcore、Daycore | 无新增 |
+| Catch | Easy、Hard-Rock | Hidden、Flashlight、Double-Time、Half-Time、Nightcore、Daycore | Classic |
+| Mania | One-Key 至 Ten-Keys、Dual-Stages、Invert、Hold-Off、Mirror | Hidden、Flashlight、Constant-Speed、Double-Time、Half-Time、Nightcore、Daycore | Classic |
 
-CLI 普通导出不支持“实时预览新增”列的 Mod；回放导出使用回放文件中的 Mod。
+CLI 普通导出不支持“实时预览新增”列的 Mod。
+
+回放预览使用回放文件中的 Mod，不接受 `--mod` 或 `--convert`。PNG、GIF、MP4 均按实时预览的累积支持范围检查回放 Mod，并使用相同的判定与成绩规则，不按输出格式降档；不支持的 Mod、设置或组合会报错。
+
+回放 PNG 允许携带 DT、HT、NC、DC，仍按原谱面时间轴排版，不因倍速压缩或拉长。Standard PNG 保留快照时刻的 HD、FL、TC 等可见性效果；Taiko、Catch、Mania PNG 使用静态时间轴，不显示 HD、FL 的动态隐藏或遮罩。回放 GIF、MP4 按 Mod 倍速播放并显示相应动态效果；GIF 无音频，MP4 同时应用对应的音频速度与音高规则。其他输出限制见[回放说明](#输出与兼容性)。
 
 ### 全名与缩写对照
 

@@ -9,8 +9,9 @@ use crate::domain::parser::round_half_even;
 use crate::render::canvas::{Img, Rgba};
 use crate::render::cpu::modes::mania::animation::{
     build_scroll_map, build_video_layout, compute_time_range, mania_flashlight, mania_hidden,
-    mania_visibility_timeline, segment_left, visible_pos_window,
+    mania_visibility_timeline, visible_pos_window,
 };
+use crate::render::cpu::modes::mania::hit_flash::HitFlashes;
 use crate::render::cpu::modes::mania::skin::load_mania_skin_config;
 use crate::render::cpu::modes::mania::{
     apply_hold_off_mod, apply_inverse_mod, apply_mirror_mod, build_sv_changes, darken,
@@ -20,6 +21,27 @@ use crate::render::geometry::{GameMode, OutputFormat};
 use crate::render::scene::{FrameSceneBuilder, SceneRect};
 use crate::render::text::render_text_sprite;
 use crate::render::wgpu::RealtimeFrameSource;
+
+#[cfg(feature = "replay")]
+pub fn prepare_replay(
+    prepared: Arc<crate::replay::preparation::mania::PreparedMania>,
+    gameplay: Arc<crate::gameplay::timeline::GameplayTimeline>,
+    font: Option<crate::render::shared::replay::font::ArgonFont>,
+    dimensions: (u32, u32),
+) -> Result<RealtimeFrameSource> {
+    let plan = crate::render::shared::mania::replay::ReplayRenderPlan::new(
+        prepared,
+        gameplay,
+        font,
+        Some(dimensions),
+    )?;
+    Ok(RealtimeFrameSource::new(GameMode::Mania, move |time| {
+        let mut scene = FrameSceneBuilder::new(dimensions.0, dimensions.1, time);
+        plan.draw_scene(&mut scene, time);
+        plan.draw_scene_overlay(&mut scene, time);
+        Ok(scene.finish())
+    }))
+}
 
 /// 为 Mania 会话预计算 SV 距离轴和物件位置，seek 时只做二分裁剪与绘制。
 pub fn prepare_realtime(
@@ -51,6 +73,13 @@ pub fn prepare_realtime(
     // 与 MP4 导出用同一套画布布局：物件层就是 16:9 画布本身，
     // 否则 FL 遮罩只盖住舞台区域，合成阶段补出的背景不会被压暗。
     let layout = build_video_layout(&skin_config, OutputFormat::Mp4);
+    let hit_flashes = crate::config::current()
+        .render
+        .mania
+        .mp4
+        .style
+        .SHOW_HIT_FLASH
+        .then(|| HitFlashes::new(&hit_objects, &palette, &layout));
     let native_mania = is_native_mania(beatmap);
     let cs_mode = mods.is_some_and(|value| value.cs_override);
     let scroll_map = build_scroll_map(beatmap, &original_objects, cs_mode, native_mania);
@@ -112,7 +141,7 @@ pub fn prepare_realtime(
         GameMode::Mania,
         move |absolute_time_ms| {
             let snapshot_pos = scroll_map.position_at(absolute_time_ms as f64);
-            let left = segment_left(0, &layout);
+            let left = layout.playfield_left;
             let mut scene = FrameSceneBuilder::new(
                 layout.image_width as u32,
                 layout.image_height as u32,
@@ -177,6 +206,9 @@ pub fn prepare_realtime(
                 );
             }
 
+            if let Some(flashes) = &hit_flashes {
+                flashes.draw_scene(&mut scene, absolute_time_ms, left, &layout);
+            }
             if let Some(timeline) = &visibility {
                 if let Some(notes) = notes {
                     let cover = mania_hidden(timeline, absolute_time_ms, &layout);
@@ -377,7 +409,7 @@ mod tests {
         for keys in [4, 7] {
             let skin = load_mania_skin_config(keys, OutputFormat::Mp4);
             let layout = build_video_layout(&skin, OutputFormat::Mp4);
-            let left = segment_left(0, &layout);
+            let left = layout.playfield_left;
             let palette = crate::render::cpu::modes::mania::lane_palette(keys);
             let holds: Vec<_> = palette.iter().map(|&color| darken(color, 0.5)).collect();
             let objects: Vec<_> = (0..keys as usize)

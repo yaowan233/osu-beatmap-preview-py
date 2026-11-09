@@ -1,4 +1,4 @@
-//! osu!catch 自动接盘时间轴与几何，供 FL 定位与接盘绘制复用。
+//! osu!catch 自动预览与回放接盘时间轴及几何，供 FL 定位与接盘绘制复用。
 
 use super::animation::AnimationLayout;
 use super::constants::*;
@@ -22,9 +22,116 @@ pub struct CatcherPath {
     keys: Vec<Keyframe>,
     hyper_intervals: Vec<(f64, f64)>,
     colors: Vec<(f64, [f64; 3], bool)>,
+    replay_range: Option<(f64, f64)>,
 }
 
 impl CatcherPath {
+    #[cfg(feature = "replay")]
+    pub fn from_replay(
+        prepared: &crate::replay::preparation::catch::PreparedCatch,
+        gameplay: &crate::gameplay::timeline::GameplayTimeline,
+    ) -> Self {
+        let mut path = Self {
+            keys: gameplay
+                .document
+                .frames
+                .iter()
+                .map(|frame| Keyframe {
+                    time: frame.time_ms as f64,
+                    x: f64::from(frame.cursor[0]),
+                    dash: frame.keys == 1,
+                })
+                .collect(),
+            hyper_intervals: Vec::new(),
+            colors: Vec::new(),
+            replay_range: Some((
+                gameplay.document.frames[0].time_ms as f64,
+                gameplay.failure_time.unwrap_or(f64::INFINITY),
+            )),
+        };
+        if let Some(end) = gameplay.failure_time {
+            let x = path.position_at_f64(end);
+            path.keys.retain(|key| key.time <= end);
+            path.add(end, x, false);
+        }
+        for (index, object) in prepared.objects.iter().enumerate() {
+            let time = object.event_time_or_start();
+            if !object.hyper_dash
+                || !gameplay.objects[index]
+                    .head
+                    .is_some_and(|(_, result)| result.is_hit())
+            {
+                continue;
+            }
+            let Some(target) = prepared.objects[index + 1..]
+                .iter()
+                .find(|o| matches!(o.object_type, ObjType::Fruit | ObjType::Droplet))
+            else {
+                continue;
+            };
+            let start_x = path.position_at_f64(time);
+            let direction = (target.x - start_x).signum();
+            let mut end = target.event_time_or_start();
+            let first_key = path
+                .keys
+                .partition_point(|key| key.time <= time)
+                .saturating_sub(1);
+            let last_key = path.keys.partition_point(|key| key.time < end);
+            for pair in
+                path.keys[first_key..last_key.saturating_add(1).min(path.keys.len())].windows(2)
+            {
+                let [a, b] = [pair[0], pair[1]];
+                if b.time <= time || a.time >= end || b.x == a.x {
+                    continue;
+                }
+                if (b.x - target.x) * direction >= 0.0 {
+                    let crossing = a.time + (target.x - a.x) / (b.x - a.x) * (b.time - a.time);
+                    if crossing >= time {
+                        end = end.min(crossing);
+                        break;
+                    }
+                }
+            }
+            // 下一次非小水滴判定也会结束当前 hyperdash，包括漏接和香蕉。
+            if let Some(next) = prepared.objects[index + 1..]
+                .iter()
+                .find(|o| o.object_type != ObjType::TinyDroplet)
+            {
+                end = end.min(next.event_time_or_start());
+            }
+            end = end.min(gameplay.failure_time.unwrap_or(end));
+            if direction != 0.0 && end > time {
+                path.hyper_intervals.push((time, end));
+            }
+        }
+        path.build_colors();
+        path
+    }
+
+    pub(super) fn active_at(&self, time: f64) -> bool {
+        self.replay_range
+            .is_none_or(|(start, end)| time >= start && time <= end)
+    }
+
+    fn build_colors(&mut self) {
+        let hyper_color = crate::config::current().skin.HYPER_DASH;
+        for &(start, end) in &self.hyper_intervals {
+            for (at, active) in [(start, true), (end, false)] {
+                let from = self.colors.last().map_or(
+                    PLATE_COLOR.map(f64::from),
+                    |&(previous, color, was_active)| {
+                        blend_color(
+                            color,
+                            if was_active { hyper_color } else { PLATE_COLOR },
+                            at - previous,
+                        )
+                    },
+                );
+                self.colors.push((at, from, active));
+            }
+        }
+    }
+
     fn add(&mut self, time: f64, x: f64, dash: bool) {
         self.keys.push(Keyframe {
             time,
@@ -44,10 +151,20 @@ impl CatcherPath {
             return PLAYFIELD_WIDTH / 2.0;
         }
         let a = self.keys[index - 1];
-        let Some(b) = self.keys.get(index) else {
-            return a.x;
-        };
-        a.x + (b.x - a.x) * ((time - a.time) / (b.time - a.time))
+        let x = self.keys.get(index).map_or(a.x, |b| {
+            let factor = (time - a.time) / (b.time - a.time);
+            if self.replay_range.is_some() {
+                // 回放处理器先用 float 插值，再由 CatcherArea 限制位置。
+                f64::from(a.x as f32 + (b.x as f32 - a.x as f32) * factor as f32)
+            } else {
+                a.x + (b.x - a.x) * factor
+            }
+        });
+        if self.replay_range.is_some() {
+            x.clamp(0.0, PLAYFIELD_WIDTH)
+        } else {
+            x
+        }
     }
 
     fn state_at(&self, time: f64) -> (bool, bool) {
@@ -207,7 +324,9 @@ impl CatcherPath {
     }
 
     pub fn draw_scene(&self, scene: &mut FrameSceneBuilder, time: i64, layout: &AnimationLayout) {
-        let white = std::sync::Arc::new(Img::new(1, 1, [255; 4]));
+        // 渲染器按 Arc 身份缓存纹理，拖尾必须跨帧复用同一张白色贴图。
+        static WHITE: std::sync::OnceLock<std::sync::Arc<Img>> = std::sync::OnceLock::new();
+        let white = WHITE.get_or_init(|| std::sync::Arc::new(Img::new(1, 1, [255; 4])));
         self.plates(time, layout, |rect, color, additive| {
             if additive {
                 scene.transformed_sprite(
@@ -312,6 +431,7 @@ pub fn build_catcher_path(objects: &[RenderObject], circle_size: f64) -> Catcher
         }],
         hyper_intervals: Vec::new(),
         colors: Vec::new(),
+        replay_range: None,
     };
     let half_width =
         CATCHER_BASE_SIZE * (1.0 - 0.7 * ((circle_size - 5.0) / 5.0)).abs() * ALLOWED_CATCH_RANGE
@@ -448,22 +568,7 @@ pub fn build_catcher_path(objects: &[RenderObject], circle_size: f64) -> Catcher
         merged.push((start, end));
     }
     path.hyper_intervals = merged;
-    let hyper_color = crate::config::current().skin.HYPER_DASH;
-    for &(start, end) in &path.hyper_intervals {
-        for (at, active) in [(start, true), (end, false)] {
-            let from = path.colors.last().map_or(
-                PLATE_COLOR.map(f64::from),
-                |&(previous, color, was_active)| {
-                    blend_color(
-                        color,
-                        if was_active { hyper_color } else { PLATE_COLOR },
-                        at - previous,
-                    )
-                },
-            );
-            path.colors.push((at, from, active));
-        }
-    }
+    path.build_colors();
     path
 }
 
@@ -773,5 +878,26 @@ mod tests {
             }
         }
         assert_eq!(image.data, expected.data);
+    }
+
+    #[test]
+    fn dash_trail_reuses_texture_across_frames_and_seeks() {
+        use super::super::animation::build_animation_layout;
+        use crate::render::geometry::OutputFormat;
+        let path = build_catcher_path(&[object(100.0, 1000), object(250.0, 1200)], 5.0);
+        let layout = build_animation_layout(5.0, 5.0, OutputFormat::Gif);
+        let mut previous = None;
+        for time in [1040, 1100, 1040] {
+            let mut scene =
+                FrameSceneBuilder::new(layout.frame_width as u32, layout.frame_height as u32, time);
+            path.draw_scene(&mut scene, time, &layout);
+            let scene = scene.finish();
+            assert_eq!(scene.resources.len(), 1);
+            let white = scene.resources.values().next().unwrap();
+            if let Some(previous) = &previous {
+                assert!(std::sync::Arc::ptr_eq(previous, white));
+            }
+            previous = Some(std::sync::Arc::clone(white));
+        }
     }
 }

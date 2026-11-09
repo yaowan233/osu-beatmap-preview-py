@@ -31,7 +31,9 @@ impl GameplayTimeline {
     pub fn standard_policy(&self) -> crate::replay::compatibility::StandardPolicy {
         match self.policy {
             crate::replay::compatibility::ReplayPolicy::Standard(policy) => policy,
-            crate::replay::compatibility::ReplayPolicy::Taiko(_) => {
+            crate::replay::compatibility::ReplayPolicy::Taiko(_)
+            | crate::replay::compatibility::ReplayPolicy::Catch(_)
+            | crate::replay::compatibility::ReplayPolicy::Mania(_) => {
                 panic!("Standard consumer received Taiko replay")
             }
         }

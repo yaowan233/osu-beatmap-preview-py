@@ -10,8 +10,12 @@
 
 mod assets;
 mod catch;
+#[cfg(feature = "replay")]
+mod catch_replay;
 mod common;
 mod mania;
+#[cfg(feature = "replay")]
+mod mania_replay;
 mod mixer;
 mod music;
 mod nightcore;

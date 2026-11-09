@@ -49,7 +49,10 @@ pub(super) fn select(beatmap: &Beatmap, plan: &mut RenderPlan) -> Result<()> {
         (OutputFormat::Gif, 3) => {
             let config = &runtime.render.mania.gif;
             (
-                Some(config.structure.IMAGES_PER_ROW),
+                config
+                    .structure
+                    .ROW_COUNT
+                    .checked_mul(config.structure.IMAGES_PER_ROW),
                 config.style.DURATION_MS as f64,
             )
         }

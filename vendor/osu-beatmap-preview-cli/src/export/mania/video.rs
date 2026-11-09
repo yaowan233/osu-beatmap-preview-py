@@ -5,6 +5,7 @@
 //! 时间范围由 `--time-points` 和 `--duration-time` 控制。
 
 use osu_beatmap_preview_core::render::cpu::modes::mania::constants as mania_constants;
+use osu_beatmap_preview_core::render::cpu::modes::mania::hit_flash::HitFlashes;
 
 use crate::export::canvas::{Img, Rgba};
 use crate::media::audio::AudioSourceJob;
@@ -24,7 +25,7 @@ use std::path::Path;
 use super::animation::{
     build_scroll_map, build_video_layout, compute_time_range, draw_gif_hit_object,
     draw_gif_sv_indicators, draw_segment_background, mania_flashlight, mania_hidden,
-    mania_visibility_timeline, segment_left, visible_pos_window,
+    mania_visibility_timeline, visible_pos_window,
 };
 use super::skin::load_mania_skin_config;
 use super::{
@@ -90,6 +91,13 @@ pub(crate) fn render_mania_video(
 
     let skin_config = load_mania_skin_config(key_count, crate::export::geometry::OutputFormat::Mp4);
     let layout = build_video_layout(&skin_config, crate::export::geometry::OutputFormat::Mp4);
+    let hit_flashes = crate::config::current()
+        .render
+        .mania
+        .mp4
+        .style
+        .SHOW_HIT_FLASH
+        .then(|| HitFlashes::new(&hit_objects, &palette, &layout));
     let native_mania = is_native_mania(beatmap);
     let scroll_map = build_scroll_map(beatmap, &original_objects, cs_mode, native_mania);
     let time_range = compute_time_range(
@@ -155,7 +163,7 @@ pub(crate) fn render_mania_video(
                 mania_constants::mp4::style::IMAGE_BACKGROUND,
             );
         }
-        draw_segment_background(&mut bg, segment_left(0, &layout), &layout);
+        draw_segment_background(&mut bg, layout.playfield_left, &layout);
         bg
     };
 
@@ -164,7 +172,7 @@ pub(crate) fn render_mania_video(
         let snapshot_pos = scroll_map.position_at(snapshot_time as f64);
         let mut canvas = static_bg.clone();
         let mut notes = hidden.then(|| Img::new(canvas.w, canvas.h, [0, 0, 0, 0]));
-        let seg_left = segment_left(0, &layout);
+        let seg_left = layout.playfield_left;
         draw_gif_sv_indicators(
             &mut canvas,
             &sv_changes,
@@ -199,6 +207,9 @@ pub(crate) fn render_mania_video(
                 &layout,
                 pixels_per_scroll_unit,
             );
+        }
+        if let Some(flashes) = &hit_flashes {
+            flashes.draw(&mut canvas, snapshot_time, seg_left, &layout);
         }
         if let Some(timeline) = &visibility {
             if let Some(mut notes) = notes {

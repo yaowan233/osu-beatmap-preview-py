@@ -248,6 +248,8 @@ mod tests {
     /// 「谱面明明有故事板却完全不显示」。填充用注释行：夹具足够大但解析开销小。
     #[test]
     fn oversized_osb_beyond_legacy_cap_is_still_loaded() {
+        // 素材装载会写进程级日志，必须与日志测试及渲染测试共用隔离锁。
+        let _guard = crate::logging::test_guard();
         use std::io::Write as _;
         use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

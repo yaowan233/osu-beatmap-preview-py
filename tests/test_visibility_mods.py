@@ -43,9 +43,7 @@ objects = (
 )
 target = {'taiko': 1, 'ctb': 2, 'mania': 3}.get(convert, mode)
 name = {0: 'standard', 1: 'taiko', 2: 'catch', 3: 'mania'}[target]
-structure = {'IMAGES_PER_ROW': 1}
-if target != 3:
-    structure['ROW_COUNT'] = 1
+structure = {'ROW_COUNT': 1, 'IMAGES_PER_ROW': 1}
 config = json.dumps({
     'paths': {'CACHE_DIR': cache.parent.as_posix(), 'OUTPUT_DIR': (root / 'output').as_posix(),
               'LOG_DIR': (root / 'logs').as_posix()},

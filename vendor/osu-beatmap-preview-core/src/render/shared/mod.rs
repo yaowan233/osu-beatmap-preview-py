@@ -9,3 +9,9 @@ pub mod replay;
 pub mod standard;
 #[cfg(feature = "replay")]
 pub mod taiko;
+
+#[cfg(feature = "replay")]
+pub mod catch;
+
+#[cfg(feature = "replay")]
+pub mod mania;

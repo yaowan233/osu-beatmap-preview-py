@@ -135,8 +135,10 @@ fn validate(score: &Score) -> Result<()> {
     {
         return Err(PreviewError::download("官方成绩响应缺少有效谱面信息"));
     }
-    if !matches!(score.ruleset_id, 0 | 1) {
-        return Err(PreviewError::download("只支持 Standard 和 Taiko 成绩"));
+    if !matches!(score.ruleset_id, 0..=3) {
+        return Err(PreviewError::download(
+            "只支持 Standard、Taiko、Catch 和 Mania 成绩",
+        ));
     }
     if !score.has_replay {
         return Err(PreviewError::download("选中的成绩没有可下载回放"));
@@ -163,9 +165,29 @@ fn select(client: &Client<'_>, source: &ReplaySource, bid: &str) -> Result<Score
             struct User {
                 id: u64,
             }
-            // 不指定谱面时不补 mode，让官方按玩家资料的默认模式查询。
-            // 指定谱面仍默认 osu，保持原有玩家加谱面来源的行为。
-            let mode = mode.or((!bid.is_empty()).then_some(ReplayMode::Osu));
+            // 指定谱面时跟随原谱；无谱面时由官方采用玩家默认模式。
+            let mode = match mode {
+                Some(mode) => Some(*mode),
+                None if !bid.is_empty() => {
+                    #[derive(Deserialize)]
+                    struct Beatmap {
+                        id: u64,
+                        mode: String,
+                    }
+                    let beatmap: Beatmap = client.get(&format!("beatmaps/{bid}"), &[])?;
+                    if beatmap.id.to_string() != bid {
+                        return Err(PreviewError::download("官方返回的谱面 ID 不符"));
+                    }
+                    Some(match beatmap.mode.as_str() {
+                        "osu" => ReplayMode::Osu,
+                        "taiko" => ReplayMode::Taiko,
+                        "fruits" => ReplayMode::Fruits,
+                        "mania" => ReplayMode::Mania,
+                        _ => return Err(PreviewError::download("官方谱面响应缺少有效模式")),
+                    })
+                }
+                None => None,
+            };
             // 用户名放在 URL 路径时逐字节编码，数字用户名也明确按名称查询。
             let encoded = user
                 .as_bytes()

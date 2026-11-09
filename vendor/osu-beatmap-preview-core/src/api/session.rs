@@ -201,8 +201,11 @@ mod osr {
                 .ok_or_else(|| PreviewError::new("回放缺少谱面"))?;
             let prepared = PreparedReplay::prepare(beatmap, &document)?;
             let gameplay = Arc::new(prepared.compile(document)?);
-            if let PreparedReplay::Taiko(p) = &prepared {
-                bundle.beatmap = Some(p.beatmap.clone());
+            match &prepared {
+                PreparedReplay::Taiko(p) => bundle.beatmap = Some(p.beatmap.clone()),
+                PreparedReplay::Catch(p) => bundle.beatmap = Some(p.beatmap.clone()),
+                PreparedReplay::Mania(p) => bundle.beatmap = Some(p.beatmap.clone()),
+                _ => (),
             }
             let mut session = Self::from_bundle(bundle, options)?;
             let first = prepared.first();
@@ -239,7 +242,10 @@ mod osr {
                     crate::render::geometry::OutputFormat::Mp4,
                 )
                 .frame_height,
+                    PreparedReplay::Catch(p) => crate::render::cpu::modes::catch::animation::build_video_animation_layout(p.cs,p.ar,crate::render::geometry::OutputFormat::Mp4).frame_height,
                     PreparedReplay::Taiko(_) => crate::render::cpu::modes::taiko::animation_render::build_video_animation_layout(crate::render::cpu::modes::taiko::animation_render::compute_time_range(),crate::render::geometry::OutputFormat::Mp4).image_height,
+                    PreparedReplay::Mania(p) => crate::render::cpu::modes::mania::animation::build_video_layout(
+                        &crate::render::cpu::modes::mania::skin::load_mania_skin_config(p.keys,crate::render::geometry::OutputFormat::Mp4),crate::render::geometry::OutputFormat::Mp4).image_height,
                 }
             });
             // 分辨率切换重新计算当前格式 SCALE，物件与 HUD 在目标像素尺寸直接绘制。
@@ -247,12 +253,30 @@ mod osr {
             match &osr.prepared {
                 PreparedReplay::Standard(_) => cfg.render.standard.mp4.SCALE *= scale,
                 PreparedReplay::Taiko(_) => cfg.render.taiko.mp4.SCALE *= scale,
+                PreparedReplay::Catch(_) => cfg.render.catch.mp4.SCALE *= scale,
+                PreparedReplay::Mania(_) => cfg.render.mania.mp4.SCALE *= scale,
             }
             let config = Arc::new(cfg);
             self.source = config::with_config(Arc::clone(&config), || match &osr.prepared {
                 PreparedReplay::Standard(prepared) => {
                     crate::render::wgpu::modes::standard::osr::prepare(
                         &self.beatmap,
+                        Arc::clone(prepared),
+                        Arc::clone(&osr.gameplay),
+                        osr.font.as_ref().map(|f| (**f).clone()),
+                        self.options.render.dimensions(),
+                    )
+                }
+                PreparedReplay::Catch(prepared) => {
+                    crate::render::wgpu::modes::catch::prepare_replay(
+                        Arc::clone(prepared),
+                        Arc::clone(&osr.gameplay),
+                        osr.font.as_ref().map(|f| (**f).clone()),
+                        Some(self.options.render.dimensions()),
+                    )
+                }
+                PreparedReplay::Mania(prepared) => {
+                    crate::render::wgpu::modes::mania::prepare_replay(
                         Arc::clone(prepared),
                         Arc::clone(&osr.gameplay),
                         osr.font.as_ref().map(|f| (**f).clone()),
@@ -394,6 +418,84 @@ mod osr {
                 session.seek(200.0, 500.0);
                 assert_eq!(session.replay_timeline().unwrap().state_at(1500.0), &state);
             }
+        }
+
+        #[test]
+        fn mania_replay_seek_and_resolution_changes_keep_recorded_inputs() {
+            let (prepared, document) = crate::replay::preparation::mania::tests::fixture(
+                "64,192,1000,128,0,2000:0:0:0:0:\n192,192,2500,1,0",
+                &[(0, 0), (1000, 1), (2000, 0), (2530, 2), (2800, 0)],
+            );
+            let mut session = RealtimeSession::from_replay_bundle(
+                ResourceBundle::new(prepared.beatmap),
+                RealtimeOptions::default(),
+                document,
+                None,
+            )
+            .unwrap();
+            assert_eq!(session.mode_as_i32(), 3);
+            let before = session.scene_at_absolute(1500).unwrap();
+            let state = session.replay_timeline().unwrap().state_at(2700.0).clone();
+            let track_height = |scene: &crate::render::scene::FrameScene| {
+                scene.resources.values().map(|r| r.h).max().unwrap()
+            };
+            let initial_height = track_height(&before);
+            session.seek(0.0, 1200.0);
+            session.set_render_size(854, 480).unwrap();
+            let smaller = session.scene_at_absolute(1500).unwrap();
+            assert_eq!(smaller.size.height, 480);
+            assert!(track_height(&smaller) < initial_height);
+            session
+                .set_render_size(before.size.width, before.size.height)
+                .unwrap();
+            let restored = session.scene_at_absolute(1500).unwrap();
+            assert_eq!(
+                format!("{:?}", restored.commands),
+                format!("{:?}", before.commands)
+            );
+            assert_eq!(session.replay_timeline().unwrap().state_at(2700.0), &state);
+            assert!(session
+                .hitsound_required_names()
+                .iter()
+                .any(|name| name.contains("hitnormal")));
+        }
+
+        #[test]
+        fn catch_replay_seek_resize_and_audio_keep_independent_judgements() {
+            let beatmap = crate::parse_beatmap_bytes(include_bytes!(
+                "../../assets/test-fixtures/replay-catch.osu"
+            ))
+            .unwrap();
+            let document = crate::replay::parse_osr(include_bytes!(
+                "../../assets/test-fixtures/replay-catch.osr"
+            ))
+            .unwrap();
+            let mut session = RealtimeSession::from_replay_bundle(
+                ResourceBundle::new(beatmap),
+                RealtimeOptions::default(),
+                Arc::new(document),
+                None,
+            )
+            .unwrap();
+            assert_eq!(session.mode_as_i32(), 2);
+            let expected = session.scene_at_absolute(2400).unwrap();
+            let state = session.replay_timeline().unwrap().state_at(2400.0).clone();
+            session.play(0.0);
+            session.pull_audio(500.0, 4096);
+            session.seek(500.0, 1000.0);
+            session.set_render_size(854, 480).unwrap();
+            assert_eq!(session.scene_at_absolute(2400).unwrap().size.height, 480);
+            session.set_render_size(1280, 720).unwrap();
+            assert_eq!(
+                format!("{:?}", session.scene_at_absolute(2400).unwrap().commands),
+                format!("{:?}", expected.commands)
+            );
+            assert_eq!(&state, session.replay_timeline().unwrap().state_at(2400.0));
+            assert!(session
+                .hitsound_required_names()
+                .iter()
+                .any(|n| n.contains("slidertick")));
+            assert!(session.set_show_catcher(false).is_err());
         }
 
         fn session(fail: bool) -> RealtimeSession {
@@ -746,6 +848,36 @@ impl RealtimeSession {
             self.source = prepare_source(
                 &self.beatmap,
                 2,
+                &self.settings,
+                TimeAxis::new(self.timeline.first_object_ms),
+                &config,
+            )?;
+        }
+        self.options.core_config = config;
+        Ok(())
+    }
+
+    /// 仅重建 Mania 的击打闪光配置与帧源，保持播放时钟和音频不变。
+    pub fn set_show_hit_flash(&mut self, enabled: bool) -> Result<()> {
+        if self
+            .options
+            .core_config
+            .render
+            .mania
+            .mp4
+            .style
+            .SHOW_HIT_FLASH
+            == enabled
+        {
+            return Ok(());
+        }
+        let mut config = (*self.options.core_config).clone();
+        config.render.mania.mp4.style.SHOW_HIT_FLASH = enabled;
+        let config = Arc::new(config);
+        if self.mode_as_i32() == 3 {
+            self.source = prepare_source(
+                &self.beatmap,
+                3,
                 &self.settings,
                 TimeAxis::new(self.timeline.first_object_ms),
                 &config,
@@ -1726,6 +1858,79 @@ mod tests {
         let hidden = session.scene_at_absolute(1000).unwrap().commands.len();
         session.set_show_catcher(true).unwrap();
         assert!(session.scene_at_absolute(1000).unwrap().commands.len() > hidden);
+    }
+
+    #[test]
+    fn hit_flash_toggle_preserves_playback_and_survives_mods_and_resize() {
+        let beatmap = crate::parse_beatmap_bytes(
+            b"osu file format v14\n[General]\nMode:3\n[Difficulty]\nCircleSize:4\n[TimingPoints]\n0,500,4,1,0,100,1,0\n[HitObjects]\n64,192,1000,1,0\n192,192,2000,1,0\n",
+        ).unwrap();
+        let mut options = test_options();
+        Arc::make_mut(&mut options.core_config)
+            .render
+            .mania
+            .gif
+            .style
+            .SHOW_HIT_FLASH = true;
+        Arc::make_mut(&mut options.core_config)
+            .render
+            .mania
+            .mp4
+            .style
+            .SHOW_HIT_FLASH = false;
+        let mut session =
+            RealtimeSession::from_bundle(ResourceBundle::new(beatmap), options).unwrap();
+        session.seek(100.0, 0.0);
+        session.play(100.0);
+        let hidden = session.scene_at_absolute(1000).unwrap().commands.len();
+        let epoch = session.audio_epoch();
+        assert!(
+            !session
+                .options()
+                .core_config
+                .render
+                .mania
+                .mp4
+                .style
+                .SHOW_HIT_FLASH
+        );
+        session.set_show_hit_flash(true).unwrap();
+        assert_eq!(
+            session.scene_at_absolute(1000).unwrap().commands.len(),
+            hidden + 1
+        );
+        assert_eq!(
+            session.scene_at_absolute(999).unwrap().commands.len(),
+            hidden
+        );
+        assert_eq!(session.audio_epoch(), epoch);
+        assert_eq!(session.clock_ms(200.0), 100.0);
+        session
+            .set_mods(vec!["MR".into(), "DT".into()], 200.0)
+            .unwrap();
+        session.set_render_size(854, 480).unwrap();
+        assert!(
+            session
+                .options()
+                .core_config
+                .render
+                .mania
+                .mp4
+                .style
+                .SHOW_HIT_FLASH
+        );
+        session.set_show_hit_flash(false).unwrap();
+        let hidden = session.scene_at_absolute(1000).unwrap().commands.len();
+        let after_fade = session.scene_at_absolute(1320).unwrap().commands.len();
+        session.set_show_hit_flash(true).unwrap();
+        assert_eq!(
+            session.scene_at_absolute(1000).unwrap().commands.len(),
+            hidden + 1
+        );
+        assert_eq!(
+            session.scene_at_absolute(1320).unwrap().commands.len(),
+            after_fade
+        );
     }
 
     /// 背景暗化运行时可调并夹紧到 0～1；背景/视频/故事板三层共用这一系数。

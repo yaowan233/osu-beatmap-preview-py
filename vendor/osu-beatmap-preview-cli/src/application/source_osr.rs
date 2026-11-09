@@ -44,11 +44,6 @@ pub(super) fn load(
     let replay_bytes = read_limited(&osr_path, 64 * 1024 * 1024)?;
     let document = Arc::new(parse_osr(&replay_bytes)?);
     compatibility::select_replay(&document)?;
-    if document.header.ruleset_id == 1 && request.output.format.as_deref() == Some("png") {
-        return Err(PreviewError::new(
-            "Taiko replay preview supports GIF/MP4; PNG is not supported",
-        ));
-    }
     let checksum = &document.header.beatmap_md5;
     let identity = format!("{:x}", Sha256::digest(&replay_bytes))[..16].to_string();
     let downloads = Official {
@@ -90,8 +85,8 @@ fn resolve_resources(
             Ok::<_, PreviewError>((PathBuf::from(path), bytes))
         })
         .transpose()?;
-    // PNG/GIF 只消费谱面与回放；即使传入 OSZ，也不读取包或检查歌曲，避免触发媒体下载。
-    if matches!(request.output.format.as_deref(), Some("png" | "gif")) {
+    // 默认格式为 PNG/GIF，只消费谱面与回放；即使传入 OSZ，也不读取包或检查歌曲。
+    if request.output.format.as_deref() != Some("mp4") {
         let (path, bytes) = match external {
             Some(local) => local,
             None => {

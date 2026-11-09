@@ -315,6 +315,7 @@ pub struct RenderManiaPngConfig {
 #[serde(deny_unknown_fields)]
 #[allow(dead_code, non_snake_case, non_camel_case_types)]
 pub struct RenderManiaGifStructureConfig {
+    pub ROW_COUNT: usize,
     pub IMAGES_PER_ROW: usize,
 }
 
@@ -326,6 +327,7 @@ pub struct RenderManiaGifStyleConfig {
     pub FPS: i64,
     pub SCROLL_SPEED: f64,
     pub SHOW_SV_LABEL: bool,
+    pub SHOW_HIT_FLASH: bool,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -350,6 +352,7 @@ pub struct RenderManiaMp4StyleConfig {
     pub ENABLE_BEATMAP_HITSOUND: bool,
     pub HITSOUND_VOLUME: i64,
     pub SHOW_SV_LABEL: bool,
+    pub SHOW_HIT_FLASH: bool,
     pub LANE_DARKEN_ALPHA: f64,
 }
 
@@ -387,6 +390,8 @@ pub struct SkinMANIAKEYS_1Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -396,6 +401,8 @@ pub struct SkinMANIAKEYS_2Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -405,6 +412,8 @@ pub struct SkinMANIAKEYS_3Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -414,6 +423,8 @@ pub struct SkinMANIAKEYS_4Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -423,6 +434,8 @@ pub struct SkinMANIAKEYS_5Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -432,6 +445,8 @@ pub struct SkinMANIAKEYS_6Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -441,6 +456,8 @@ pub struct SkinMANIAKEYS_7Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -450,6 +467,8 @@ pub struct SkinMANIAKEYS_8Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -459,6 +478,8 @@ pub struct SkinMANIAKEYS_9Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -468,6 +489,8 @@ pub struct SkinMANIAKEYS_10Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -477,6 +500,8 @@ pub struct SkinMANIAKEYS_11Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -486,6 +511,8 @@ pub struct SkinMANIAKEYS_12Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -495,6 +522,8 @@ pub struct SkinMANIAKEYS_13Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -504,6 +533,8 @@ pub struct SkinMANIAKEYS_14Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -513,6 +544,8 @@ pub struct SkinMANIAKEYS_15Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -522,6 +555,8 @@ pub struct SkinMANIAKEYS_16Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -531,6 +566,8 @@ pub struct SkinMANIAKEYS_17Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -540,6 +577,8 @@ pub struct SkinMANIAKEYS_18Config {
     pub COLUMN_WIDTHS: Vec<i64>,
     pub COLUMN_LINE_WIDTHS: Vec<i64>,
     pub HIT_POSITION: i64,
+    pub COMBO_POSITION: i64,
+    pub SCORE_POSITION: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]

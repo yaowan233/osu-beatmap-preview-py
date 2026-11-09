@@ -42,9 +42,7 @@ objects = (
     f'[HitObjects]\\n{objects}\\n', encoding='utf-8'
 )
 name = {0: 'standard', 1: 'taiko', 3: 'mania'}[mode]
-structure = {'IMAGES_PER_ROW': 1}
-if mode != 3:
-    structure['ROW_COUNT'] = 1
+structure = {'ROW_COUNT': 1, 'IMAGES_PER_ROW': 1}
 config = json.dumps({
     'paths': {'CACHE_DIR': cache.parent.as_posix(), 'OUTPUT_DIR': (root / 'output').as_posix(),
               'LOG_DIR': (root / 'logs').as_posix()},

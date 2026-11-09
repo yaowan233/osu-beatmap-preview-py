@@ -1,3 +1,6 @@
 //! 规则实现只消费输入与逻辑谱面，输出判定契约，不访问渲染或宿主。
+pub(crate) mod catch;
 pub mod standard;
 pub mod taiko;
+
+pub(crate) mod mania;

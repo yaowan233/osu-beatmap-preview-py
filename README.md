@@ -4,8 +4,8 @@
 Python 原生扩展。渲染器通过 PyO3 直接运行在 Python 进程内，不需要下载、配置或启动额外的
 可执行文件。
 
-> 当前为早期开发版本。0.1.11 使用上游 main（v1.5.2 之后）的固定提交
-> [`4c1df8f`](https://github.com/2710165659/osu-beatmap-preview/commit/4c1df8f31eb89b93ff7667d570f6270a4bd6eaf3)。
+> 当前为早期开发版本。0.1.12 使用上游 v1.5.7 的固定提交
+> [`a4c24e0`](https://github.com/2710165659/osu-beatmap-preview/commit/a4c24e0e447e249a2ea28cd03bc772719771257c)。
 > core、CLI 和构建资源随仓库分发，确保各平台 wheel 使用相同的渲染行为。
 
 ## 安装
