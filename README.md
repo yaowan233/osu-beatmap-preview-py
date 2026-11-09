@@ -4,7 +4,7 @@
 Python 原生扩展。渲染器通过 PyO3 直接运行在 Python 进程内，不需要下载、配置或启动额外的
 可执行文件。
 
-> 当前为早期开发版本。0.1.12 使用上游 v1.5.7 的固定提交
+> 当前为早期开发版本。0.1.13 使用上游 v1.5.7 的固定提交
 > [`a4c24e0`](https://github.com/2710165659/osu-beatmap-preview/commit/a4c24e0e447e249a2ea28cd03bc772719771257c)。
 > core、CLI 和构建资源随仓库分发，确保各平台 wheel 使用相同的渲染行为。
 
@@ -42,6 +42,59 @@ print(result["preview-img"])
 
 `times` 使用 `+` 分隔多个秒数，也支持 `preview`；`duration_time` 控制 GIF 片段或 MP4
 区间时长。`config` 可传配置文件路径或内联 JSON/YAML，`scale` 用于临时覆盖输出倍率。
+
+### 回放预览
+
+`generate_replay_preview()` 和 `generate_replay_preview_async()` 支持 Standard、Taiko、Catch、
+Mania 的 PNG、GIF、MP4 回放预览。三种来源 `osr_file`、`score_id`、`user` 必须且只能选一种；
+游戏模式和模组从回放读取，不传 `convert` 或 `mods`。
+
+本地 PNG/GIF 只需 `.osr` 和与回放 MD5 匹配的原始 `.osu`，无需联网：
+
+```python
+from pathlib import Path
+from osu_beatmap_preview import generate_replay_preview_async
+
+result = await generate_replay_preview_async(
+    Path("play.osr"),
+    osu_file=Path("map.osu"),
+    format="gif",
+    times="0",
+    duration_time=5,
+    fps=30,
+    output_dir=Path("previews"),
+)
+print(result["preview-img"])
+print(result["replay-info"])  # 玩家、模式、判定状态、回放身份及缓存信息
+```
+
+MP4 还需要包含对应谱面与音频的 `.osz`，通过 `osz_file="map.osz"` 提供。
+缺少本地资源时，上游会通过官方 API 查找并下载；PNG/GIF 不会从 `.osz` 提取谱面，离线使用时
+需显式提供 `osu_file`。谱面 MD5 不匹配会立即报错，不会改用其他谱面。
+
+在线来源示例：
+
+```python
+result = await generate_replay_preview_async(score_id=6086051920, format="png")
+result = await generate_replay_preview_async(user="player", bid=4498112, format="gif")
+result = await generate_replay_preview_async(
+    user="player", score_select="recent", mode="mania", include_fails=True,
+)
+```
+
+在线查询和资源下载需要环境变量 `OSU_API_TOKEN`，或 `OSU_CLIENT_ID` 与 `OSU_CLIENT_SECRET`；
+OAuth 凭据也可通过 `config` 中的 `download.auth` 配置。目标成绩必须有可访问的回放。
+玩家查询提供 `bid` 时默认取该难度最高分，不提供时默认取最近一次完成的成绩；
+`score_select` 可选 `best`、`recent`，`best` 要求 `bid`。`mode`、`score_select` 和
+`include_fails` 仅适用于 `user`，其中 `include_fails` 仅适用于 `recent`。
+查询模式可用 `osu`、`taiko`、`fruits`、`mania`，也接受 `std`、`standard`、`fruit`、`ctb`、`catch`。
+
+不指定 `format` 时，Standard 默认 GIF，其余模式默认 PNG。`times` 是相对于首个物件的秒数，
+也支持 `preview`；GIF 和 Standard PNG 可通过 `+` 提供多个采样起点。
+Taiko/Catch/Mania PNG 默认显示整谱判定概览，截取区间时必须同时提供一个 `times` 起点和
+`duration_time`。MP4 只接受一个起点，`duration_time` 指定时长，省略起点及时长时导出完整回放。
+输出沿用 `preview-img` 字段，
+另有 `replay-info` 和 `beatmap-info`；`no_cache=True` 可跳过缓存。
 
 ### CTB GIF 模组
 
@@ -94,13 +147,14 @@ Catch HD 在 Kiai 区段持续保留淡淡的物件轮廓，不随 BPM 闪烁；
 
 FL 在 Standard 跟随自动光标（滑条期间额外暗化），在 Catch 跟随接盘，在 Taiko 固定于判定区；
 Mania FL 只保留中部横向可视带。Standard、Taiko、Catch 在 100/200 combo 时缩小光圈。
-预览没有玩家输入或回放，轨迹用谱面物件之间的插值估算，连击按无 miss 进度计算；
+谱面预览的轨迹用谱面物件之间的插值估算，连击按无 miss 进度计算；
 Standard 的光圈跟随延迟使用连续阻尼近似，Catch 香蕉雨期间沿用相邻水果的插值路线。
 Taiko、Catch、Mania 的 PNG 是静态概览，不支持 HD/FL；Standard 的 PNG 快照支持二者。
 
 ### 异步取消与并发
 
-上游 Rust API 当前是同步接口，没有提供取消令牌。取消 `generate_preview_async()` 所在的
+上游 Rust API 当前是同步接口，没有提供取消令牌。取消 `generate_preview_async()` 或
+`generate_replay_preview_async()` 所在的
 Python task 不会中止已经开始的原生渲染；Bot 集成时应使用 semaphore 限制并发。若需要真正的
 超时中止，应先在上游 library API 增加协作式取消能力。
 
