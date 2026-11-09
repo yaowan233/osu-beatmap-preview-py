@@ -34,8 +34,10 @@ __all__ = [
 
 
 def generate_preview(
-    bid: int | str,
+    bid: int | str | None = None,
     *,
+    osu_file: str | PathLike[str] | None = None,
+    osz_file: str | PathLike[str] | None = None,
     format: PreviewFormat | None = None,
     convert: ConvertMode | None = None,
     mods: str | None = None,
@@ -47,16 +49,24 @@ def generate_preview(
     no_cache: bool = False,
     fps: int | None = None,
     duration_time: float | None = None,
-    config: str | None = None,
+    config: str | PathLike[str] | None = None,
     scale: float | None = None,
+    output_dir: str | PathLike[str] | None = None,
 ) -> dict[str, Any]:
-    """Render a beatmap preview and return the renderer result.
+    """Render a beatmap from bid, a local osu_file, or a local osz_file.
+
+    bid may be omitted for osu_file or a single-difficulty osz_file. Archives with
+    multiple difficulties require bid to select a BeatmapID. Standalone osu_file
+    supports PNG/GIF; MP4 needs an osz_file with the beatmap and media. If both
+    files are provided, osu_file supplies the beatmap and osz_file the media.
 
     This function performs network and CPU-heavy work. Async applications should
     call :func:`generate_preview_async` instead.
     """
     raw = generate_preview_json(
-        str(bid),
+        str(bid) if bid is not None else None,
+        osu_file=fspath(osu_file) if osu_file is not None else None,
+        osz_file=fspath(osz_file) if osz_file is not None else None,
         format=format,
         convert=convert,
         mods=mods,
@@ -68,15 +78,18 @@ def generate_preview(
         no_cache=no_cache,
         fps=fps,
         duration_time=duration_time,
-        config=config,
+        config=fspath(config) if config is not None else None,
         scale=scale,
+        output_dir=fspath(output_dir) if output_dir is not None else None,
     )
     return _decode_result(raw)
 
 
 async def generate_preview_async(
-    bid: int | str,
+    bid: int | str | None = None,
     *,
+    osu_file: str | PathLike[str] | None = None,
+    osz_file: str | PathLike[str] | None = None,
     format: PreviewFormat | None = None,
     convert: ConvertMode | None = None,
     mods: str | None = None,
@@ -88,13 +101,16 @@ async def generate_preview_async(
     no_cache: bool = False,
     fps: int | None = None,
     duration_time: float | None = None,
-    config: str | None = None,
+    config: str | PathLike[str] | None = None,
     scale: float | None = None,
+    output_dir: str | PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Render without blocking the caller's asyncio event loop."""
     return await asyncio.to_thread(
         generate_preview,
         bid,
+        osu_file=osu_file,
+        osz_file=osz_file,
         format=format,
         convert=convert,
         mods=mods,
@@ -108,6 +124,7 @@ async def generate_preview_async(
         duration_time=duration_time,
         config=config,
         scale=scale,
+        output_dir=output_dir,
     )
 
 

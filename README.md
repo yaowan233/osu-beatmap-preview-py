@@ -4,7 +4,7 @@
 Python 原生扩展。渲染器通过 PyO3 直接运行在 Python 进程内，不需要下载、配置或启动额外的
 可执行文件。
 
-> 当前为早期开发版本。0.1.13 使用上游 v1.5.7 的固定提交
+> 当前为早期开发版本。0.1.14 使用上游 v1.5.7 的固定提交
 > [`a4c24e0`](https://github.com/2710165659/osu-beatmap-preview/commit/a4c24e0e447e249a2ea28cd03bc772719771257c)。
 > core、CLI 和构建资源随仓库分发，确保各平台 wheel 使用相同的渲染行为。
 
@@ -42,6 +42,45 @@ print(result["preview-img"])
 
 `times` 使用 `+` 分隔多个秒数，也支持 `preview`；`duration_time` 控制 GIF 片段或 MP4
 区间时长。`config` 可传配置文件路径或内联 JSON/YAML，`scale` 用于临时覆盖输出倍率。
+
+### 用户上传的 `.osu` / `.osz`
+
+Bot 先将上传附件保存到本地，再把文件路径传给现有的 `generate_preview()` 或
+`generate_preview_async()`，无需上传到 osu! 或提供 API 凭据。路径参数接受字符串或 `pathlib.Path`，
+原来的 `generate_preview_async(bid, ...)` 调用保持兼容。
+
+```python
+from pathlib import Path
+from osu_beatmap_preview import generate_preview_async
+
+result = await generate_preview_async(
+    osu_file=Path("uploads/map.osu"),
+    format="gif",
+    times="0",
+    duration_time=5,
+    output_dir=Path("outputs/job-123"),
+)
+print(result["preview-img"])
+
+# 单难度谱面包可省略 bid；多难度包用 bid 选择对应 BeatmapID。
+result = await generate_preview_async(
+    osz_file=Path("uploads/map.osz"),
+    bid=4498112,
+    format="mp4",
+    times="0",
+    duration_time=5,
+    output_dir=Path("outputs/job-124"),
+)
+```
+
+单独的 `.osu` 支持 PNG/GIF，也接受没有有效 BeatmapID 的本地谱面；MP4 需要 `.osz` 中的音频等
+媒体资源。只有一个顶层 `.osu` 的 `.osz` 可省略 bid，多难度包必须提供 bid，按有效 BeatmapID
+选择难度。传入 bid 与外部 `.osu` 的 ID 不一致时会报错。
+
+也可同时提供 `osu_file` 和 `osz_file`：外部 `.osu` 用于渲染，`.osz` 提供媒体资源，包内必须有
+相同 BeatmapID 的难度。`convert`、`mods`、时间区间、帧率、配置、缩放和缓存参数继续可用，
+返回结构仍为 `preview-img` 与 `beatmap-info`。`output_dir` 可为每次 Bot 任务指定输出目录，
+`config` 也支持 `pathlib.Path`。
 
 ### 回放预览
 

@@ -11,8 +11,10 @@ create_exception!(_core, PreviewError, PyException);
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (
-    bid,
+    bid = None,
     *,
+    osu_file = None,
+    osz_file = None,
     format = None,
     convert = None,
     mods = None,
@@ -26,10 +28,13 @@ create_exception!(_core, PreviewError, PyException);
     duration_time = None,
     config = None,
     scale = None,
+    output_dir = None,
 ))]
 fn generate_preview_json(
     py: Python<'_>,
-    bid: String,
+    bid: Option<String>,
+    osu_file: Option<String>,
+    osz_file: Option<String>,
     format: Option<String>,
     convert: Option<String>,
     mods: Option<String>,
@@ -43,9 +48,13 @@ fn generate_preview_json(
     duration_time: Option<f64>,
     config: Option<String>,
     scale: Option<f64>,
+    output_dir: Option<String>,
 ) -> PyResult<String> {
-    if bid.trim().is_empty() {
+    if bid.as_deref().is_some_and(|bid| bid.trim().is_empty()) {
         return Err(PyValueError::new_err("bid must not be empty"));
+    }
+    if bid.is_none() && osu_file.is_none() && osz_file.is_none() {
+        return Err(PyValueError::new_err("provide bid, osu_file, or osz_file"));
     }
 
     if gif_clip || gif_clip_label {
@@ -93,7 +102,9 @@ fn generate_preview_json(
     }
 
     let config = config_for_gap(config, gap)?;
-    let mut options = RenderRequest::new(bid);
+    let mut options = RenderRequest::new(bid.unwrap_or_default());
+    options.source.osu_file = osu_file;
+    options.source.osz_file = osz_file;
     options.ruleset.convert = convert;
     options.ruleset.mods = mods;
     options.output.format = format;
@@ -103,6 +114,7 @@ fn generate_preview_json(
     options.output.fps = fps;
     options.execution.config = config;
     options.output.scale = scale;
+    options.output.output_dir = output_dir;
 
     render_request_json(py, options)
 }
