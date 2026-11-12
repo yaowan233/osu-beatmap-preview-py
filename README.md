@@ -4,8 +4,8 @@
 Python 原生扩展。渲染器通过 PyO3 直接运行在 Python 进程内，不需要下载、配置或启动额外的
 可执行文件。
 
-> 当前为早期开发版本。0.1.14 使用上游 v1.5.7 的固定提交
-> [`a4c24e0`](https://github.com/2710165659/osu-beatmap-preview/commit/a4c24e0e447e249a2ea28cd03bc772719771257c)。
+> 当前为早期开发版本。0.1.15 使用上游 v1.6.0 的固定提交
+> [`d42e1ff`](https://github.com/2710165659/osu-beatmap-preview/commit/d42e1ffcb59678314cd0422b1ce8fdc02875d988)。
 > core、CLI 和构建资源随仓库分发，确保各平台 wheel 使用相同的渲染行为。
 
 ## 安装
@@ -135,11 +135,15 @@ Taiko/Catch/Mania PNG 默认显示整谱判定概览，截取区间时必须同�
 输出沿用 `preview-img` 字段，
 另有 `replay-info` 和 `beatmap-info`；`no_cache=True` 可跳过缓存。
 
+上游 v1.6.0 的 `replay-info.state` 将 `score`、`max_combo`、`combo`、`accuracy`、`rank` 和
+`statistics` 中的各项改为 `"重算值/原记录值"` 字符串，例如 `"1000000/998000"`，缺失值以 `-`
+表示。这些字段不再直接返回数值；`replay-info.recorded-score` 仍提供原始分数。
+
 ### CTB GIF 模组
 
 原生 CTB 和 standard 转 CTB 的 GIF 支持 `hd`、`ez`、`hr`、`dt`、`ht`。
 HD 会让水果、水滴及香蕉在到达判定线前渐隐；支持 `hd+ez`、`hd+hr`、`hd+dt`、`hd+ht`。
-`ez+hr` 和 `dt+ht` 是互斥组合。PNG 静态图支持 EZ、HR，不支持 HD、DT、HT。
+`ez+hr` 和 `dt+ht` 是互斥组合。PNG 静态图支持 EZ、HR、MR，不支持 HD、DT、HT。
 Hyperdash（红果）的外圈默认使用红色 `#FF0000`，可通过 `skin.HYPER_DASH` 配置 RGB 颜色；
 水果本体继续使用谱面 Combo 颜色，HD 渐隐同时作用于本体、白边和红圈。
 
@@ -160,10 +164,11 @@ result = await generate_preview_async(
 | --- | --- |
 | Standard | `EZ`、`HR`、`HD`、`FL`、`MR`、`TC`、`DA`、`DT`、`HT`、`NC`、`DC` |
 | Taiko | `EZ`、`HR`、`HD`、`FL`、`SW`、`CS`、`DT`、`HT`、`NC`、`DC` |
-| Catch | `EZ`、`HR`、`HD`、`FL`、`DT`、`HT`、`NC`、`DC` |
-| Mania | `HD`、`FL`、`1K`–`10K`、`DS`、`IN`、`HO`、`MR`、`CS`、`DT`、`HT`、`NC`、`DC` |
+| Catch | `EZ`、`HR`、`HD`、`FL`、`MR`、`DT`、`HT`、`NC`、`DC` |
+| Mania | `HD`、`FL`、`FI`、`1K`–`10K`、`DS`、`IN`、`HO`、`MR`、`CS`、`DT`、`HT`、`NC`、`DC` |
 
 组合中的每个模组都必须受当前模式支持；Mania 的 `HD+FL` 互斥，其余三种模式可组合使用。
+Mania 的 `FI`（Fade In）不能与 `HD` 或 `FL` 组合。
 `HD+TC`、`IN+HO`、`EZ+HR`、`DT+HT` 互斥；mania 的键数模组和 DS 只影响 standard 转谱。
 GIF 和 MP4 使用相同的模组支持规则，GIF 在 15、30、60 fps 下也会保持请求的播放时长。
 
@@ -175,6 +180,8 @@ Catch 的 GIF / MP4 通过 `render.catch.<format>.style.SHOW_CATCHER` 显示自�
 太鼓 GIF / MP4 默认显示击打按键和音符击飞效果，可通过 `SHOW_KEY_OVERLAY`、`SHOW_HIT_EFFECTS` 控制。
 自定义配置请以 [当前上游配置](vendor/osu-beatmap-preview-core/assets/shared_config.yml) 为准，旧版部分排版、配色字段已移除。
 太鼓 PNG 转盘显示总击打数与时长，GIF 和 MP4 显示完整空心转盘、剩余击打数及完成淡出。
+太鼓 PNG 的 `render.taiko.png.style.SPACING_PER_BPM` 默认是 `most`，也支持 `auto`、
+`"180BPM"` 这类固定 BPM 配置及旧版数字值；Python 的 `gap` 参数继续使用数字配置。
 四模式 MP4 可通过
 `render.<mode>.mp4.style.ENABLE_STORYBOARD` 和 `ENABLE_BACKGROUND_VIDEO` 启用故事板及背景视频，
 两项默认关闭；`<mode>` 为 `standard`、`taiko`、`catch` 或 `mania`。

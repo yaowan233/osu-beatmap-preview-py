@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "osu-beatmap-preview-cli"
-version = "1.5.7"
+version = "1.6.0"
 dependencies = [
  "bytes",
  "color_quant",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "osu-beatmap-preview-core"
-version = "1.5.7"
+version = "1.6.0"
 dependencies = [
  "font8x8",
  "getrandom 0.2.17",
@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "osu-beatmap-preview-py"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "osu-beatmap-preview-cli",
  "osu-beatmap-preview-core",

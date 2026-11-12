@@ -131,6 +131,11 @@ else:
 assert result['status'] == 'success', result
 assert result['replay-info']['rulesetId'] == mode, result
 assert result['replay-info']['player'] == 'Python test', result
+state = result['replay-info']['state']
+assert state['score'].endswith('/200'), state
+assert state['max_combo'].endswith('/2'), state
+assert state['statistics']['great'].endswith('/2'), state
+assert state['accuracy'].endswith('/-') and state['rank'].endswith('/-'), state
 assert result['replay-info']['cache-hit'] is False, result
 output = Path(result['preview-img'])
 assert output.is_file() and output.is_relative_to(root / 'output'), output

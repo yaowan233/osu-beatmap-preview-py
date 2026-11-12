@@ -49,7 +49,7 @@ config = json.dumps({
               'LOG_DIR': (root / 'logs').as_posix()},
     'render': {name: {'gif': {'SCALE': 0.5, 'structure': structure}}},
 })
-baseline = '+'.join(token for token in mods.split('+') if token not in ('hd', 'fl')) or None
+baseline = '+'.join(token for token in mods.split('+') if token not in ('hd', 'fl', 'fi')) or None
 frames = []
 for selected in (baseline, mods, '+'.join(reversed(mods.split('+')))):
     result = preview.generate_preview(
@@ -71,6 +71,13 @@ for selected in (baseline, mods, '+'.join(reversed(mods.split('+')))):
 assert frames[0] != frames[1], (mode, convert, mods, 'mod had no visual effect')
 assert frames[1] == frames[2], (mode, convert, mods, 'mod order changed pixels')
 if target == 3:
+    for conflict in ('fi+hd', 'fi+fl'):
+        try:
+            preview.generate_preview(999930001, format='gif', mods=conflict, config=config)
+        except preview.PreviewError as error:
+            assert 'FI cannot be used together' in str(error), str(error)
+        else:
+            raise AssertionError('FI must conflict with HD and FL')
     try:
         preview.generate_preview(999930001, format='gif', convert=convert or None,
                                  mods='hd+fl', config=config)
@@ -104,6 +111,7 @@ if target != 0:
         (0, "ctb", "hd+fl+dt"),
         (3, "", "hd+cs+ho+ht"),
         (3, "", "fl+cs+in+dt"),
+        (3, "", "fi+cs+dt"),
         (0, "mania", "hd+4k+ds+cs+ht"),
         (0, "mania", "fl+4k+ds+in+dt"),
     ],

@@ -14,7 +14,8 @@ use crate::{
     replay::preparation::catch::PreparedCatch,
 };
 
-const PATH_COLOR: [u8; 4] = [252, 97, 143, 230];
+const PATH_COLOR: [u8; 4] = [190, 161, 205, 230];
+const DASH_PATH_COLOR: [u8; 4] = [255, 45, 105, 230];
 const DROPLET_COLOR: [u8; 4] = colors::BLUE;
 const MISS_BAND_COLOR: [u8; 4] = colors::with_alpha(MISS_COLOR, 72);
 const DROPLET_BAND_COLOR: [u8; 4] = colors::with_alpha(DROPLET_COLOR, 72);
@@ -50,7 +51,7 @@ pub fn render_scene(
         u32::from_le_bytes(seed),
     );
     draw_states(&mut image, layout, &labels, time_axis);
-    // 判定边框叠在原物件之上，真实接盘轨迹与范围线最后绘制。
+    // 判定边框和接盘范围叠在原物件之上，真实轨迹最后绘制。
     draw_judgements(
         &mut image,
         layout,
@@ -58,7 +59,6 @@ pub fn render_scene(
         gameplay,
         chart_end_time as f64,
     );
-    draw_path(&mut image, layout, gameplay, chart_end_time as f64);
     draw_miss_plates(
         &mut image,
         layout,
@@ -66,11 +66,20 @@ pub fn render_scene(
         gameplay,
         chart_end_time as f64,
     );
+    draw_path(&mut image, layout, gameplay, chart_end_time as f64);
     image
 }
 
 fn scale() -> f64 {
     output_scale(GameMode::Catch, OutputFormat::Png)
+}
+
+fn path_color(keys: u32) -> [u8; 4] {
+    if keys == 1 {
+        DASH_PATH_COLOR
+    } else {
+        PATH_COLOR
+    }
 }
 
 fn draw_path(image: &mut Img, layout: &CatchPngLayout, gameplay: &GameplayTimeline, end: f64) {
@@ -92,6 +101,7 @@ fn draw_path(image: &mut Img, layout: &CatchPngLayout, gameplay: &GameplayTimeli
         if to <= from {
             continue;
         }
+        let color = path_color(pair[0].keys);
         let x0 = f64::from(pair[0].cursor[0]);
         let x1 = f64::from(pair[1].cursor[0]);
         // 先插值再限制盘子位置；越界输入在场地边缘保留平台段。
@@ -117,7 +127,7 @@ fn draw_path(image: &mut Img, layout: &CatchPngLayout, gameplay: &GameplayTimeli
                 x_at(span[1]),
                 layout,
             ) {
-                image.draw_line(p.0, p.1, q.0, q.1, (1.5 * scale()).max(1.0), PATH_COLOR);
+                image.draw_line(p.0, p.1, q.0, q.1, (1.5 * scale()).max(1.0), color);
             }
         }
     }
@@ -296,7 +306,7 @@ fn draw_miss_plates(
     gameplay: &GameplayTimeline,
     end: f64,
 ) {
-    // 盘子统一在最上层绘制，远距离 Miss 也保留；相邻判定不能覆盖前一个盘子。
+    // 盘子叠在判定之上、轨迹之下，远距离 Miss 也保留；相邻判定不能覆盖前一个盘子。
     for event in visible_events(gameplay, layout.chart_start_time, end) {
         if event.kind != EventKind::Judgement
             || !matches!(event.result, HitResult::Miss | HitResult::LargeTickMiss)
@@ -318,8 +328,11 @@ fn draw_miss_plates(
             )
         });
         if let Some((x0, x1)) = plate_range {
-            // 接盘范围线最后画，压在音符和判定边框上，便于比较实际差距。
-            for (width, color) in [(7.0, MARKER_BACKGROUND), (4.0, PATH_COLOR)] {
+            let color = gameplay
+                .input
+                .snapshot_at(event.time)
+                .map_or(PATH_COLOR, |input| path_color(input.keys));
+            for (width, color) in [(7.0, MARKER_BACKGROUND), (4.0, color)] {
                 image.draw_line(
                     left + x0 * layout.playfield_scale,
                     y as f64,
@@ -453,6 +466,62 @@ mod tests {
     }
 
     #[test]
+    fn dash_path_color_follows_held_keys_across_columns_and_fractional_scales() {
+        let (_, mut gameplay) = fixture();
+        gameplay.input = ReplayTimeline::new(
+            [
+                (900, 1),
+                (1500, 0),
+                (2000, 1),
+                (2000, 0),
+                (2400, 1),
+                (3400, 0),
+                (4000, 1),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, (time_ms, keys))| ReplayFrame {
+                time_ms,
+                cursor: [256.0, 0.0],
+                sequence,
+                delta_ms: 0,
+                keys,
+            })
+            .collect(),
+        );
+        gameplay.settlement_time = 3800.0;
+        for png_scale in [0.75, 1.25] {
+            let mut config = crate::config::CoreConfig::default();
+            config.render.catch.png.SCALE = png_scale;
+            config.render.catch.gif.SCALE = 2.0;
+            config.render.catch.mp4.SCALE = 0.5;
+            crate::config::with_config(Arc::new(config), || {
+                let layout = layout();
+                let mut image = blank(&layout);
+                draw_path(&mut image, &layout, &gameplay, 4200.0);
+                let path_row = |time| {
+                    let (column, y) = locate_time(time - layout.chart_start_time, &layout);
+                    (playfield_left(column, &layout)
+                        ..playfield_left(column, &layout) + layout.visible_playfield_width)
+                        .map(|x| image.get(x as u32, y as u32))
+                        .filter(|pixel| pixel[3] > 0)
+                        .collect::<Vec<_>>()
+                };
+                let normal = path_row(1700);
+                let dash = path_row(1100);
+                assert!(!normal.is_empty());
+                assert!(normal.iter().all(|pixel| *pixel == PATH_COLOR));
+                assert_eq!(dash, vec![DASH_PATH_COLOR; normal.len()]);
+                assert_eq!(path_row(2200), normal);
+                assert_eq!(path_row(2700), dash);
+                assert_eq!(path_row(3200), dash);
+                assert_eq!(path_row(3600), normal);
+                assert!(path_row(3900).is_empty());
+            });
+        }
+    }
+
+    #[test]
     fn path_clips_window_splits_columns_and_stops_at_failure() {
         let (_, mut gameplay) = fixture();
         gameplay.input = ReplayTimeline::new(
@@ -503,6 +572,60 @@ mod tests {
     }
 
     #[test]
+    fn miss_plate_matches_input_color_and_stays_below_path() {
+        let (prepared, mut gameplay) = fixture();
+        gameplay.input = ReplayTimeline::new(
+            [(1000, 0), (2100, 1), (3000, 0)]
+                .into_iter()
+                .enumerate()
+                .map(|(sequence, (time_ms, keys))| ReplayFrame {
+                    time_ms,
+                    cursor: [256.0, 0.0],
+                    sequence,
+                    delta_ms: 0,
+                    keys,
+                })
+                .collect(),
+        );
+        gameplay.settlement_time = 3000.0;
+        let mut event = gameplay.events[0].clone();
+        event.kind = EventKind::Judgement;
+        event.result = HitResult::Miss;
+        event.position = Some([256.0, 0.0]);
+        gameplay.events = vec![event];
+        for png_scale in [0.75, 1.25] {
+            let mut config = crate::config::CoreConfig::default();
+            config.render.catch.png.SCALE = png_scale;
+            crate::config::with_config(Arc::new(config), || {
+                let layout = layout();
+                for (time, color) in [(1800.0, PATH_COLOR), (2100.0, DASH_PATH_COLOR)] {
+                    gameplay.events[0].time = time;
+                    let image = render_scene(
+                        &layout,
+                        &[],
+                        &[],
+                        TimeAxis::new(1000),
+                        &prepared,
+                        &gameplay,
+                        3000,
+                    );
+                    let (column, y) = locate_time(rhe(time) - layout.chart_start_time, &layout);
+                    let x = (playfield_left(column, &layout) as f64
+                        + 256.0 * layout.playfield_scale)
+                        .floor() as i64;
+                    assert_eq!(
+                        image.get((x + rhe(10.0 * png_scale)) as u32, y as u32),
+                        color
+                    );
+                    // 判定恰逢 dash 按下时，盘子下方的普通轨迹仍须穿过深色描边。
+                    let offset = rhe(2.5 * png_scale);
+                    assert_eq!(image.get(x as u32, (y + offset) as u32), PATH_COLOR);
+                }
+            });
+        }
+    }
+
+    #[test]
     fn judgement_borders_preserve_centers_banana_fill_and_miss_plates() {
         let (mut prepared, mut gameplay) = fixture();
         let layout = layout();
@@ -511,6 +634,7 @@ mod tests {
         event.kind = EventKind::Judgement;
         for frame in Arc::make_mut(&mut gameplay.input.frames) {
             frame.cursor[0] = 0.0;
+            frame.keys = 0;
         }
 
         for (kind, miss) in [

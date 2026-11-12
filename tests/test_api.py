@@ -53,13 +53,11 @@ async def test_generate_preview_async_uses_same_api(monkeypatch: pytest.MonkeyPa
         lambda *_args, **_kwargs: '{"preview-img":"preview.png"}',
     )
 
-    assert await preview.generate_preview_async(456, format="png") == {
-        "preview-img": "preview.png"
-    }
+    assert await preview.generate_preview_async(456, format="png") == {"preview-img": "preview.png"}
 
 
 def test_native_extension_uses_updated_version() -> None:
-    assert preview.__version__ == "0.1.14"
+    assert preview.__version__ == "0.1.15"
 
 
 @pytest.mark.parametrize(
@@ -71,9 +69,7 @@ def test_native_extension_uses_updated_version() -> None:
         ({"format": "png", "gap": 120.0, "config": "{}"}, "custom config"),
     ],
 )
-def test_native_argument_compatibility_validation(
-    kwargs: dict[str, object], message: str
-) -> None:
+def test_native_argument_compatibility_validation(kwargs: dict[str, object], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         preview.generate_preview(123, **kwargs)
 
@@ -94,10 +90,12 @@ def test_native_request_forwards_options_to_renderer(
         preview.generate_preview(123, **kwargs)
 
 
-def test_native_gap_renders_taiko_png(tmp_path: Path) -> None:
+@pytest.mark.parametrize("spacing", [None, "most", "auto", "180BPM"])
+def test_native_gap_renders_taiko_png(tmp_path: Path, spacing: str | None) -> None:
     # 独立进程及临时缓存隔离原生配置，验证 gap 映射到当前渲染器配置。
     script = """
 import sys
+import json
 from pathlib import Path
 import osu_beatmap_preview as preview
 from PIL import Image
@@ -111,13 +109,18 @@ cache.mkdir(parents=True)
     '[TimingPoints]\\n0,500,4,1,0,100,1,0\\n'
     '[HitObjects]\\n0,0,1000,1,0\\n0,0,1500,1,2\\n', encoding='utf-8'
 )
-result = preview.generate_preview(999940001, format='png', gap=120, scale=0.25)
+spacing = json.loads(sys.argv[2])
+options = (
+    {'gap': 120} if spacing is None else
+    {'config': json.dumps({'render': {'taiko': {'png': {'style': {'SPACING_PER_BPM': spacing}}}}})}
+)
+result = preview.generate_preview(999940001, format='png', scale=0.25, **options)
 with Image.open(result['preview-img']) as image:
     assert image.format == 'PNG'
     assert image.width > 0 and image.height > 0
 """
     result = subprocess.run(
-        [sys.executable, "-c", script, str(tmp_path)],
+        [sys.executable, "-c", script, str(tmp_path), json.dumps(spacing)],
         env={**os.environ, "TEMP": str(tmp_path), "TMP": str(tmp_path), "TMPDIR": str(tmp_path)},
         capture_output=True,
         text=True,

@@ -141,7 +141,7 @@ pub fn prepare_replay(beatmap: &Beatmap, document: &ReplayDocument) -> Result<Pr
         .iter()
         .map(|o| o.source.end_time as f64)
         .fold(f64::NEG_INFINITY, f64::max);
-    let score_multiplier = score_multiplier(&mods.settings);
+    let score_multiplier = score_multiplier(&mods.settings) * if mods.no_fail { 0.5 } else { 1.0 };
     Ok(PreparedTaiko {
         beatmap,
         objects,
@@ -155,6 +155,9 @@ pub fn prepare_replay(beatmap: &Beatmap, document: &ReplayDocument) -> Result<Pr
 
 fn score_multiplier(s: &ModSettings) -> f64 {
     let mut value = 1.0;
+    if s.relax {
+        value *= 0.1;
+    }
     if s.easy {
         value *= 0.5;
     }

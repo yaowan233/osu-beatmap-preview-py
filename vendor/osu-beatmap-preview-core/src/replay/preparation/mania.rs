@@ -74,15 +74,6 @@ pub fn prepare_replay(beatmap: &Beatmap, document: &ReplayDocument) -> Result<Pr
     {
         return Err(PreviewError::parse("InvalidReplay: invalid Mania objects"));
     }
-    if document
-        .frames
-        .iter()
-        .any(|f| (f.cursor[0] as u32) >> keys != 0)
-    {
-        return Err(PreviewError::parse(
-            "InvalidReplay: Mania input exceeds column count",
-        ));
-    }
     let od = beatmap.difficulty.get_f64_or("OverallDifficulty", 5.0);
     let hp = beatmap.difficulty.get_f64_or("HPDrainRate", 5.0);
     if !od.is_finite()
@@ -98,7 +89,7 @@ pub fn prepare_replay(beatmap: &Beatmap, document: &ReplayDocument) -> Result<Pr
         ));
     }
     let difficulty_multiplier = if mods.settings.easy {
-        0.5
+        1.0 / 1.4
     } else if mods.settings.hard_rock {
         1.4
     } else {
@@ -266,7 +257,6 @@ pub(crate) mod tests {
             },
             metadata: None,
             seed: None,
-            diagnostics: Vec::new(),
             frames: frames
                 .iter()
                 .enumerate()
@@ -414,12 +404,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn easy_and_hard_rock_scale_hit_windows_for_legacy_and_lazer_replays() {
+        let (source, document) = fixture("64,192,1000,1,0", &[(0, 0), (1000, 1), (1400, 0)]);
+        for legacy in [false, true] {
+            for (code, bits, great_window, hp) in
+                [("EZ", 1 << 1, 68.5, 2.5), ("HR", 1 << 4, 35.5, 7.0)]
+            {
+                let mut replay = (*document).clone();
+                replay.header.mods_bits = bits;
+                replay.metadata = if legacy {
+                    None
+                } else {
+                    Some(
+                        serde_json::from_value(serde_json::json!({"mods":[{"acronym":code}]}))
+                            .unwrap(),
+                    )
+                };
+                let prepared = prepare_replay(&source.beatmap, &replay).unwrap();
+                assert_eq!(prepared.windows[1], great_window);
+                assert_eq!(prepared.hp, hp);
+            }
+        }
+    }
+
+    #[test]
     fn column_masks_and_mods_are_validated_before_compilation() {
         let (prepared, document) = fixture("64,192,1000,1,0", &[(0, 0), (1000, 1), (1300, 0)]);
-        for invalid in [-1.0, 0.5, 16.0, f32::NAN] {
+        for invalid in [1048576.0, -1048576.0, f32::NAN] {
             let mut replay = (*document).clone();
             replay.frames[1].cursor[0] = invalid;
             assert!(prepare_replay(&prepared.beatmap, &replay).is_err());
+        }
+        for (x, mask) in [(-1.0, 0), (0.5, 0), (16.0, 0), (17.9, 1), (1048575.0, 15)] {
+            let mut replay = (*document).clone();
+            replay.frames[1].cursor[0] = x;
+            let prepared = prepare_replay(&prepared.beatmap, &replay).unwrap();
+            let timeline =
+                crate::gameplay::engine::compile_mania(&prepared, Arc::new(replay)).unwrap();
+            assert_eq!(timeline.input_at(1000.0).unwrap().keys, mask);
         }
         for (mods, valid) in [
             (serde_json::json!([{"acronym":"4K"}]), true),
