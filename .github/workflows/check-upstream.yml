@@ -1,0 +1,86 @@
+name: Check upstream version
+
+on:
+  schedule:
+    - cron: "23 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: check-upstream
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check renderer release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check and prepare upstream update
+        id: upstream
+        run: python .github/scripts/check_upstream.py --prepare
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.upstream.outputs.tag != ''
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt
+      - name: Create update PR
+        if: steps.upstream.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.repository.default_branch }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_CURRENT: ${{ steps.upstream.outputs.current }}
+          UPSTREAM_REPOSITORY: ${{ steps.upstream.outputs.repository }}
+        shell: bash
+        run: |
+          branch="upstream/renderer-${UPSTREAM_TAG}"
+          existing=$(gh pr list --head "$branch" --base "$BASE" --state all \
+            --json url --jq '.[0].url // empty')
+          if [[ -n "$existing" ]]; then
+            echo "[已有更新 PR]($existing)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          remote_branch=$(git ls-remote --heads origin "refs/heads/$branch")
+          if [[ -z "$remote_branch" ]]; then
+            cargo metadata --format-version 1 > /dev/null
+            cargo fmt --all --check
+            git diff --check
+            git add -- vendor Cargo.toml Cargo.lock README.md THIRD_PARTY_NOTICES.md
+            git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "chore: update renderer to $UPSTREAM_TAG"
+            git push origin "HEAD:refs/heads/$branch"
+          fi
+
+          notes=$(mktemp)
+          cat > "$notes" <<EOF
+          ## Summary
+
+          同步上游 core 和 CLI，从 ${UPSTREAM_CURRENT} 更新到 ${UPSTREAM_TAG}。
+          [上游变更](${UPSTREAM_REPOSITORY}/compare/${UPSTREAM_CURRENT}...${UPSTREAM_TAG})
+
+          ## Evidence
+
+          - **Before:** 上游固定版本为 ${UPSTREAM_CURRENT}。
+          - **After:** 固定版本更新为 ${UPSTREAM_TAG}，Cargo 元数据解析和格式检查通过。
+
+          ## Merge Danger
+
+          **Door:** Two-way
+
+          **Blast Radius:** 渲染器
+          EOF
+          url=$(gh pr create --base "$BASE" --head "$branch" \
+            --title "chore: update renderer to $UPSTREAM_TAG" --body-file "$notes")
+          echo "[上游更新 PR]($url)" >> "$GITHUB_STEP_SUMMARY"
