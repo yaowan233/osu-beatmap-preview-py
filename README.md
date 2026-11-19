@@ -4,8 +4,8 @@
 Python 原生扩展。渲染器通过 PyO3 直接运行在 Python 进程内，不需要下载、配置或启动额外的
 可执行文件。
 
-> 当前为早期开发版本。0.1.15 使用上游 v1.6.0 的固定提交
-> [`d42e1ff`](https://github.com/2710165659/osu-beatmap-preview/commit/d42e1ffcb59678314cd0422b1ce8fdc02875d988)。
+> 当前为早期开发版本。0.1.16 使用上游 v1.6.1 的固定提交
+> [`9d58d39`](https://github.com/2710165659/osu-beatmap-preview/commit/9d58d39af81882ef32cea221d4e807571c12f93f)。
 > core、CLI 和构建资源随仓库分发，确保各平台 wheel 使用相同的渲染行为。
 
 ## 安装
@@ -75,7 +75,8 @@ result = await generate_preview_async(
 
 单独的 `.osu` 支持 PNG/GIF，也接受没有有效 BeatmapID 的本地谱面；MP4 需要 `.osz` 中的音频等
 媒体资源。只有一个顶层 `.osu` 的 `.osz` 可省略 bid，多难度包必须提供 bid，按有效 BeatmapID
-选择难度。传入 bid 与外部 `.osu` 的 ID 不一致时会报错。
+选择难度。外部 `.osu` 有有效 BeatmapID 时，传入的 bid 必须与它一致。单独使用缺少有效
+BeatmapID 的 `.osu` 时，也可以传入 bid。
 
 也可同时提供 `osu_file` 和 `osz_file`：外部 `.osu` 用于渲染，`.osz` 提供媒体资源，包内必须有
 相同 BeatmapID 的难度。`convert`、`mods`、时间区间、帧率、配置、缩放和缓存参数继续可用，

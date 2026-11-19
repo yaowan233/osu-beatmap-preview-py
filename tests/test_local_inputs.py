@@ -115,6 +115,13 @@ if case == 'difficulty_selection':
     fails('does not match', bid=43, osu_file=local)
     local.write_text(beatmap(99, 'Wrong archive'), encoding='utf-8')
     fails('not found', osu_file=local, osz_file=archive)
+    local.write_text(beatmap(None, 'Legacy'), encoding='utf-8')
+    result = preview.generate_preview(
+        44, osu_file=local, format='png', scale=0.25, config=config, output_dir=root/'output'
+    )
+    assert result['beatmap-info']['meta-data']['title'] == 'Legacy', result
+    assert Path(result['preview-img']).is_file()
+    fails('valid positive BeatmapID', bid=44, osu_file=local, osz_file=archive)
     raise SystemExit(0)
 
 if fmt in ('gif', 'mp4'):

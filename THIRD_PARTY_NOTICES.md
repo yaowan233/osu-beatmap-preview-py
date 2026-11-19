@@ -6,8 +6,8 @@ the MIT License:
 
 > Copyright (c) 2026 xuan_yuan
 
-The core and CLI crates are vendored from upstream v1.6.0
-[`d42e1ffcb59678314cd0422b1ce8fdc02875d988`](https://github.com/2710165659/osu-beatmap-preview/commit/d42e1ffcb59678314cd0422b1ce8fdc02875d988),
+The core and CLI crates are vendored from upstream v1.6.1
+[`9d58d39af81882ef32cea221d4e807571c12f93f`](https://github.com/2710165659/osu-beatmap-preview/commit/9d58d39af81882ef32cea221d4e807571c12f93f),
 with self-contained build assets and compatibility annotations
 for the pinned Rust toolchain. The former rendering patches are included upstream.
 Each crate includes its complete MIT license and

@@ -56,8 +56,9 @@ def generate_preview(
     """Render a beatmap from bid, a local osu_file, or a local osz_file.
 
     bid may be omitted for osu_file or a single-difficulty osz_file. Archives with
-    multiple difficulties require bid to select a BeatmapID. Standalone osu_file
-    supports PNG/GIF; MP4 needs an osz_file with the beatmap and media. If both
+    multiple difficulties require bid to select a BeatmapID. A standalone osu_file
+    accepts bid even if it has no valid BeatmapID, and supports PNG/GIF.
+    MP4 needs an osz_file with the beatmap and media. If both
     files are provided, osu_file supplies the beatmap and osz_file the media.
 
     This function performs network and CPU-heavy work. Async applications should
